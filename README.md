@@ -1,17 +1,20 @@
-# Vol
+# Volidge
 
-`Vol` is a small macOS menu bar app for using a keyboard volume knob with an
+`Volidge` is a small macOS menu bar app for using a keyboard volume knob with an
 Audient iD14 MKII. It lowers the digital audio signal before it reaches the
 interface; it does not alter the iD14's physical monitor-volume control.
 
 ## 남은 작업 목록
+
 - 볼륨 퍼센트 지수적으로 바뀌도록 (현재는 선형적인거 같고, 70만 되도 거의 안들림)
 - 애플리케이션 아이콘 클릭해서 volidge 실행하면 바로 라우팅 시작하도록.
-- 메뉴 아이콘 클릭했을 때 "Open Sound Settings" 지우기
+- 메뉴 아이콘 클릭했을 때 "Open Sound Settings" 지우기.
 - virtual audio device, Play through 이름이 좀 직관적이지 않음.
 - 메뉴 아이콘 클릭했을 때 맨 윗줄 상태 메세지? 그거 필요한가 싶음.
 - Mute 없어도 될듯.
-- dmg 파일 배경 좀 더 이쁘게
+- dmg 파일 배경 좀 더 이쁘게.
+- 이미 켜져있는 상황에서 또 키면 두 개가 켜짐. 하나만 켜지게 해야됨.
+- 다른 오디오 인터페이스에서도 적용이 가능하도록.
 
 ## What it needs
 
