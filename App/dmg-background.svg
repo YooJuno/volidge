@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="400" viewBox="0 0 660 400">
+  <defs>
+    <linearGradient id="pink" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#ff5aa0"/>
+      <stop offset="1" stop-color="#e93b84"/>
+    </linearGradient>
+  </defs>
+  <rect width="660" height="400" rx="24" fill="url(#pink)"/>
+  <text x="330" y="78" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="26" font-weight="700" fill="white">Drag Vol to Applications</text>
+  <path d="M262 215h130l-32-32 24-24 74 74-74 74-24-24 32-32H262z" fill="white" opacity="0.94"/>
+  <path d="M432 215h48" fill="none" stroke="white" stroke-width="10" stroke-linecap="round" opacity="0.45"/>
+</svg>

@@ -1,0 +1,17 @@
+# Swift Package Manager build output
+.build/
+.swiftpm/
+
+# Packaged application artifacts
+dist/
+release/
+App/AppIcon.iconset/
+
+# Xcode user and build files
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# macOS filesystem metadata
+.DS_Store
+__MACOSX/
