@@ -55,6 +55,7 @@ final class AudioRouter {
     private var savedVirtualDeviceSampleRate: Float64?
     private var volumeListenerDevice: AudioDeviceID?
     private var systemVolumeListener: AudioObjectPropertyListenerBlock?
+    private var volumeSyncTimer: Timer?
 
     var onStateChange: (() -> Void)?
     private(set) var isRunning = false {
@@ -210,6 +211,15 @@ final class AudioRouter {
     private func installSystemVolumeListener(for device: AudioDeviceID) {
         removeSystemVolumeListener()
 
+        volumeListenerDevice = device
+        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.syncVolumeFromSystemDevice(device)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        volumeSyncTimer = timer
+
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyVolumeScalar,
             mScope: kAudioDevicePropertyScopeOutput,
@@ -219,28 +229,32 @@ final class AudioRouter {
             self?.syncVolumeFromSystemDevice(device)
         }
         let status = AudioObjectAddPropertyListenerBlock(device, &address, .main, listener)
-        guard status == noErr else { return }
-
-        volumeListenerDevice = device
-        systemVolumeListener = listener
+        if status == noErr {
+            systemVolumeListener = listener
+        }
         syncVolumeFromSystemDevice(device)
     }
 
     private func removeSystemVolumeListener() {
-        guard let volumeListenerDevice, let systemVolumeListener else { return }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        AudioObjectRemovePropertyListenerBlock(volumeListenerDevice, &address, .main, systemVolumeListener)
+        volumeSyncTimer?.invalidate()
+        volumeSyncTimer = nil
+        if let volumeListenerDevice, let systemVolumeListener {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(volumeListenerDevice, &address, .main, systemVolumeListener)
+        }
         self.volumeListenerDevice = nil
         self.systemVolumeListener = nil
     }
 
     private func syncVolumeFromSystemDevice(_ device: AudioDeviceID) {
         guard let systemVolume = Self.volume(of: device) else { return }
-        volume = systemVolume
+        if abs(volume - systemVolume) > 0.0001 {
+            volume = systemVolume
+        }
         bridge.setVolume(systemVolume)
     }
 
