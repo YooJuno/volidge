@@ -53,7 +53,7 @@ final class AudioRouter {
     private var savedOutputDevice: AudioDeviceID?
     private var savedSystemOutputDevice: AudioDeviceID?
     private var savedVirtualDeviceSampleRate: Float64?
-    private var volumeListenerDevice: AudioDeviceID?
+    private var volumeControl: AudioObjectID?
     private var systemVolumeListener: AudioObjectPropertyListenerBlock?
     private var volumeSyncTimer: Timer?
 
@@ -130,8 +130,8 @@ final class AudioRouter {
     func setVolume(_ newVolume: Float) {
         volume = newVolume
         bridge.setVolume(volume)
-        guard isRunning, let volumeListenerDevice else { return }
-        try? Self.setVolume(of: volumeListenerDevice, to: volume)
+        guard isRunning, let volumeControl else { return }
+        try? Self.setVolume(of: volumeControl, to: volume)
     }
 
     func start() throws {
@@ -148,6 +148,9 @@ final class AudioRouter {
         guard outputDevice.id != inputDevice.id else {
             throw AudioRouterError.virtualDeviceSelectedAsOutput
         }
+        guard let volumeControl = Self.outputVolumeControl(for: inputDevice.id) else {
+            throw AudioRouterError.unavailableAudioUnit
+        }
 
         savedOutputDevice = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice)
         savedSystemOutputDevice = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice)
@@ -157,14 +160,14 @@ final class AudioRouter {
             try Self.matchSampleRate(of: inputDevice.id, to: outputDevice.id)
             try Self.setDefaultDevice(inputDevice.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
             try Self.setDefaultDevice(inputDevice.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
-            try Self.setVolume(of: inputDevice.id, to: volume)
+            try Self.setVolume(of: volumeControl, to: volume)
 
             bridge.setVolume(volume)
             guard let sampleRate = Self.nominalSampleRate(of: outputDevice.id) else {
                 throw AudioRouterError.unavailableAudioUnit
             }
             try bridge.start(inputDevice: inputDevice.id, outputDevice: outputDevice.id, sampleRate: sampleRate)
-            installSystemVolumeListener(for: inputDevice.id)
+            installSystemVolumeListener(for: volumeControl)
             isRunning = true
         } catch {
             stop(restoreSystemDevices: true)
@@ -208,50 +211,50 @@ final class AudioRouter {
     }
 
 
-    private func installSystemVolumeListener(for device: AudioDeviceID) {
+    private func installSystemVolumeListener(for control: AudioObjectID) {
         removeSystemVolumeListener()
 
-        volumeListenerDevice = device
+        volumeControl = control
         let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.syncVolumeFromSystemDevice(device)
+                self?.syncVolumeFromSystemControl(control)
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         volumeSyncTimer = timer
 
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput,
+            mSelector: kAudioLevelControlPropertyScalarValue,
+            mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.syncVolumeFromSystemDevice(device)
+            self?.syncVolumeFromSystemControl(control)
         }
-        let status = AudioObjectAddPropertyListenerBlock(device, &address, .main, listener)
+        let status = AudioObjectAddPropertyListenerBlock(control, &address, .main, listener)
         if status == noErr {
             systemVolumeListener = listener
         }
-        syncVolumeFromSystemDevice(device)
+        syncVolumeFromSystemControl(control)
     }
 
     private func removeSystemVolumeListener() {
         volumeSyncTimer?.invalidate()
         volumeSyncTimer = nil
-        if let volumeListenerDevice, let systemVolumeListener {
+        if let volumeControl, let systemVolumeListener {
             var address = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyVolumeScalar,
-                mScope: kAudioDevicePropertyScopeOutput,
+                mSelector: kAudioLevelControlPropertyScalarValue,
+                mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain
             )
-            AudioObjectRemovePropertyListenerBlock(volumeListenerDevice, &address, .main, systemVolumeListener)
+            AudioObjectRemovePropertyListenerBlock(volumeControl, &address, .main, systemVolumeListener)
         }
-        self.volumeListenerDevice = nil
+        self.volumeControl = nil
         self.systemVolumeListener = nil
     }
 
-    private func syncVolumeFromSystemDevice(_ device: AudioDeviceID) {
-        guard let systemVolume = Self.volume(of: device) else { return }
+    private func syncVolumeFromSystemControl(_ control: AudioObjectID) {
+        guard let systemVolume = Self.volume(of: control) else { return }
         if abs(volume - systemVolume) > 0.0001 {
             volume = systemVolume
         }
@@ -400,29 +403,69 @@ final class AudioRouter {
         }
     }
 
-    private static func volume(of device: AudioDeviceID) -> Float? {
+    private static func outputVolumeControl(for device: AudioDeviceID) -> AudioObjectID? {
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput,
+            mSelector: kAudioObjectPropertyControlList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &dataSize) == noErr,
+              dataSize >= UInt32(MemoryLayout<AudioObjectID>.size) else {
+            return nil
+        }
+
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        var controls = Array(repeating: AudioObjectID(), count: count)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, &controls) == noErr else {
+            return nil
+        }
+
+        return controls.first { control in
+            var scopeAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioControlPropertyScope,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var scope = AudioObjectPropertyScope()
+            var scopeSize = UInt32(MemoryLayout<AudioObjectPropertyScope>.size)
+            guard AudioObjectGetPropertyData(
+                control,
+                &scopeAddress,
+                0,
+                nil,
+                &scopeSize,
+                &scope
+            ) == noErr, scope == kAudioObjectPropertyScopeOutput else {
+                return false
+            }
+            return volume(of: control) != nil
+        }
+    }
+
+    private static func volume(of control: AudioObjectID) -> Float? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioLevelControlPropertyScalarValue,
+            mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
         var volume: Float = 0
         var dataSize = UInt32(MemoryLayout<Float>.size)
-        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, &volume) == noErr else {
+        guard AudioObjectGetPropertyData(control, &address, 0, nil, &dataSize, &volume) == noErr else {
             return nil
         }
         return volume
     }
 
-    private static func setVolume(of device: AudioDeviceID, to volume: Float) throws {
+    private static func setVolume(of control: AudioObjectID, to volume: Float) throws {
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput,
+            mSelector: kAudioLevelControlPropertyScalarValue,
+            mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
         var mutableVolume = min(max(volume, 0), 1)
         let status = AudioObjectSetPropertyData(
-            device,
+            control,
             &address,
             0,
             nil,
