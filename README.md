@@ -12,7 +12,7 @@ Build the integrated installer:
 cd /Users/juno/Workspace/volidge
 chmod +x scripts/build_pkg.sh scripts/build_driver.sh
 scripts/build_pkg.sh
-open release/Volidge-1.0.3.pkg
+open release/Volidge-1.0.5.pkg
 ```
 
 The installer asks for an administrator password, installs `Volidge.app` in

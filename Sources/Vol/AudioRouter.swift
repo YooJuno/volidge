@@ -100,6 +100,7 @@ final class AudioRouter {
             $0.name != Self.virtualDeviceName
                 && $0.name != Self.legacyVirtualDeviceName
                 && Self.hasChannels($0.id, scope: kAudioObjectPropertyScopeOutput)
+                && Self.canBeDefaultOutputDevice($0.id)
         }
     }
 
@@ -293,7 +294,41 @@ final class AudioRouter {
             mElement: kAudioObjectPropertyElementMain
         )
         var dataSize: UInt32 = 0
-        return AudioObjectGetPropertyDataSize(device, &address, 0, nil, &dataSize) == noErr && dataSize > 0
+        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &dataSize) == noErr,
+              dataSize >= MemoryLayout<AudioBufferList>.size else {
+            return false
+        }
+
+        let rawBufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(dataSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawBufferList.deallocate() }
+
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, rawBufferList) == noErr else {
+            return false
+        }
+
+        let bufferList = rawBufferList.assumingMemoryBound(to: AudioBufferList.self)
+        return UnsafeMutableAudioBufferListPointer(bufferList).contains { $0.mNumberChannels > 0 }
+    }
+
+    private static func canBeDefaultOutputDevice(_ device: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceCanBeDefaultDevice,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var canBeDefault: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(
+            device,
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &canBeDefault
+        ) == noErr && canBeDefault != 0
     }
 
     private static func defaultDevice(for selector: AudioObjectPropertySelector) -> AudioDeviceID? {
