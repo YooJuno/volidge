@@ -12,20 +12,26 @@ struct AudioDevice: Identifiable, Equatable {
 enum AudioRouterError: LocalizedError {
     case missingInputDevice
     case missingOutputDevice
+    case virtualDeviceSelectedAsOutput
     case microphonePermissionRequired
     case unavailableAudioUnit
+    case sampleRateChangeTimedOut
     case coreAudio(OSStatus, String)
 
     var errorDescription: String? {
         switch self {
         case .missingInputDevice:
-            return "Install BlackHole 2ch, then choose it under System input."
+            return "Volidge audio is not installed yet. Run the Volidge installer again, then reopen the app."
         case .missingOutputDevice:
-            return "Connect the iD14 MKII, then choose it under Play through."
+            return "Connect an output device, then choose it under Output."
+        case .virtualDeviceSelectedAsOutput:
+            return "Choose a speaker or audio interface as the output, not Volidge."
         case .microphonePermissionRequired:
-            return "Vol needs Microphone permission to receive audio from BlackHole. Enable Vol in Privacy & Security → Microphone, then reopen the app."
+            return "Volidge needs Microphone permission to receive audio from Volidge. Enable Volidge in Privacy & Security → Microphone, then reopen the app."
         case .unavailableAudioUnit:
-            return "macOS could not create Vol's audio route. Try quitting and reopening Vol."
+            return "macOS could not create Volidge's audio route. Try quitting and reopening Volidge."
+        case .sampleRateChangeTimedOut:
+            return "Volidge could not match the selected output's sample rate. Try stopping and starting routing again."
         case let .coreAudio(status, operation):
             return "\(operation) failed (Core Audio error \(status))."
         }
@@ -40,6 +46,9 @@ final class AudioRouter {
         static let volume = "volume"
     }
 
+    private static let virtualDeviceName = "Volidge"
+    private static let legacyVirtualDeviceName = "VolDevice"
+
     private let bridge = PassthroughAudioUnit()
     private var savedOutputDevice: AudioDeviceID?
     private var savedSystemOutputDevice: AudioDeviceID?
@@ -51,14 +60,10 @@ final class AudioRouter {
     private(set) var isRunning = false {
         didSet { notifyStateChange() }
     }
-    private(set) var isMuted = false {
-        didSet { applyVolume(); notifyStateChange() }
-    }
     private(set) var volume: Float {
         didSet {
             volume = min(max(volume, 0), 1)
             UserDefaults.standard.set(volume, forKey: PreferenceKey.volume)
-            applyVolume()
             notifyStateChange()
         }
     }
@@ -71,16 +76,17 @@ final class AudioRouter {
     }
 
     init() {
-        let defaultInput = Self.defaultDeviceName(for: kAudioHardwarePropertyDefaultInputDevice)
         let defaultOutput = Self.defaultDeviceName(for: kAudioHardwarePropertyDefaultOutputDevice)
-        selectedInputName = UserDefaults.standard.string(forKey: PreferenceKey.inputName)
-            ?? Self.firstDeviceName(containing: "blackhole", requiringInput: true)
-            ?? defaultInput
-            ?? "BlackHole 2ch"
-        selectedOutputName = UserDefaults.standard.string(forKey: PreferenceKey.outputName)
+        selectedInputName = Self.firstDeviceName(containing: "volidge", requiringInput: true)
+            ?? Self.virtualDeviceName
+        let savedOutputName = UserDefaults.standard.string(forKey: PreferenceKey.outputName)
+        let preferredOutputName: String? = savedOutputName == Self.virtualDeviceName
+            ? nil
+            : savedOutputName
+        selectedOutputName = preferredOutputName
             ?? Self.firstDeviceName(containing: "audient", requiringInput: false)
             ?? Self.firstDeviceName(containing: "id14", requiringInput: false)
-            ?? defaultOutput
+            ?? (defaultOutput == Self.virtualDeviceName ? nil : defaultOutput)
             ?? "iD14 MKII"
         volume = UserDefaults.standard.object(forKey: PreferenceKey.volume) as? Float ?? 0.7
     }
@@ -90,12 +96,16 @@ final class AudioRouter {
     }
 
     var outputDevices: [AudioDevice] {
-        Self.devices.filter { Self.hasChannels($0.id, scope: kAudioObjectPropertyScopeOutput) }
+        Self.devices.filter {
+            $0.name != Self.virtualDeviceName
+                && $0.name != Self.legacyVirtualDeviceName
+                && Self.hasChannels($0.id, scope: kAudioObjectPropertyScopeOutput)
+        }
     }
 
     var statusDescription: String {
         if isRunning {
-            return "Routing \(selectedInputName) → \(selectedOutputName) · \(bridge.diagnosticDescription)"
+            return "Routing Volidge → \(selectedOutputName) · \(bridge.diagnosticDescription)"
         }
         return "Stopped — choose devices, then start routing"
     }
@@ -106,6 +116,7 @@ final class AudioRouter {
     }
 
     func selectOutput(named name: String) {
+        guard name != Self.virtualDeviceName else { return }
         selectedOutputName = name
         restartIfNeeded()
     }
@@ -120,10 +131,6 @@ final class AudioRouter {
         try? Self.setVolume(of: volumeListenerDevice, to: volume)
     }
 
-    func toggleMute() {
-        isMuted.toggle()
-    }
-
     func start() throws {
         guard !isRunning else { return }
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
@@ -135,6 +142,9 @@ final class AudioRouter {
         guard let outputDevice = outputDevices.first(where: { $0.name == selectedOutputName }) else {
             throw AudioRouterError.missingOutputDevice
         }
+        guard outputDevice.id != inputDevice.id else {
+            throw AudioRouterError.virtualDeviceSelectedAsOutput
+        }
 
         savedOutputDevice = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice)
         savedSystemOutputDevice = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice)
@@ -144,8 +154,9 @@ final class AudioRouter {
             try Self.matchSampleRate(of: inputDevice.id, to: outputDevice.id)
             try Self.setDefaultDevice(inputDevice.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
             try Self.setDefaultDevice(inputDevice.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+            try Self.setVolume(of: inputDevice.id, to: volume)
 
-            applyVolume()
+            bridge.setVolume(1)
             guard let sampleRate = Self.nominalSampleRate(of: outputDevice.id) else {
                 throw AudioRouterError.unavailableAudioUnit
             }
@@ -172,10 +183,6 @@ final class AudioRouter {
         guard isRunning else { return }
         stop(restoreSystemDevices: true)
         try? start()
-    }
-
-    private func applyVolume() {
-        bridge.setVolume(isMuted ? 0 : 1)
     }
 
     private func notifyStateChange() {
@@ -372,7 +379,7 @@ final class AudioRouter {
             &mutableVolume
         )
         guard status == noErr else {
-            throw AudioRouterError.coreAudio(status, "Changing the BlackHole volume")
+            throw AudioRouterError.coreAudio(status, "Changing the Volidge volume")
         }
     }
 
@@ -397,6 +404,13 @@ final class AudioRouter {
             return
         }
         try setNominalSampleRate(of: inputDevice, to: outputRate)
+        for _ in 0 ..< 50 {
+            if nominalSampleRate(of: inputDevice) == outputRate {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        throw AudioRouterError.sampleRateChangeTimedOut
     }
 
     private static func setNominalSampleRate(of device: AudioDeviceID, to sampleRate: Float64) throws {
@@ -415,7 +429,7 @@ final class AudioRouter {
             &mutableSampleRate
         )
         guard status == noErr else {
-            throw AudioRouterError.coreAudio(status, "Matching BlackHole's sample rate to the output device")
+            throw AudioRouterError.coreAudio(status, "Matching Volidge's sample rate to the output device")
         }
     }
 
