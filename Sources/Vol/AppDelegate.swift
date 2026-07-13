@@ -13,7 +13,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
-        requestAudioPermission()
         enableLaunchAtLogin()
 
         mediaKeyMonitor = MediaKeyMonitor { [weak self] key in
@@ -25,7 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .volumeDown:
                 self.router.adjustVolume(by: -0.05)
             case .mute:
-                self.router.toggleMute()
+                break
             }
         }
         mediaKeyMonitor?.start()
@@ -36,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         updateStatusTitle()
         showControlWindow()
+        requestAudioPermission()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -54,7 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func configureStatusItem() {
         guard let button = statusItem.button else { return }
-        button.image = NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: "Vol")
+        button.image = NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: "Volidge")
         button.imagePosition = .imageLeading
 
         let menu = NSMenu()
@@ -64,7 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateStatusTitle() {
         guard let button = statusItem.button else { return }
-        let volume = Int((router.isMuted ? 0 : router.volume) * 100)
+        let volume = Int(router.volume * 100)
         button.title = " \(volume)%"
         button.toolTip = router.statusDescription
     }
@@ -72,26 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        let status = NSMenuItem(title: router.statusDescription, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
-        menu.addItem(.separator())
-
-        let openControlWindow = NSMenuItem(title: "Open Vol", action: #selector(showControlWindow), keyEquivalent: "")
+        let openControlWindow = NSMenuItem(title: "Open Volidge", action: #selector(showControlWindow), keyEquivalent: "")
         openControlWindow.target = self
         menu.addItem(openControlWindow)
-
-        let sourceMenu = NSMenu()
-        for device in router.inputDevices {
-            let item = NSMenuItem(title: device.name, action: #selector(selectInput(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = device.name
-            item.state = device.name == router.selectedInputName ? .on : .off
-            sourceMenu.addItem(item)
-        }
-        let sourceItem = NSMenuItem(title: "Virtual audio device", action: nil, keyEquivalent: "")
-        sourceItem.submenu = sourceMenu
-        menu.addItem(sourceItem)
 
         let outputMenu = NSMenu()
         for device in router.outputDevices {
@@ -101,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.state = device.name == router.selectedOutputName ? .on : .off
             outputMenu.addItem(item)
         }
-        let outputItem = NSMenuItem(title: "Play through", action: nil, keyEquivalent: "")
+        let outputItem = NSMenuItem(title: "Output", action: nil, keyEquivalent: "")
         outputItem.submenu = outputMenu
         menu.addItem(outputItem)
         menu.addItem(.separator())
@@ -114,14 +97,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startStop.target = self
         menu.addItem(startStop)
 
-        let mute = NSMenuItem(
-            title: router.isMuted ? "Unmute" : "Mute",
-            action: #selector(toggleMute),
-            keyEquivalent: "m"
-        )
-        mute.target = self
-        menu.addItem(mute)
-
         let launchAtLogin = NSMenuItem(
             title: "Launch at Login",
             action: #selector(toggleLaunchAtLogin),
@@ -131,23 +106,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchAtLogin.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(launchAtLogin)
 
-        let openSettings = NSMenuItem(
-            title: "Open Sound Settings…",
-            action: #selector(openSoundSettings),
-            keyEquivalent: ","
-        )
-        openSettings.target = self
-        menu.addItem(openSettings)
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "Quit Vol", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Volidge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
-    }
-
-    @objc private func selectInput(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        router.selectInput(named: name)
-        viewModel.refresh()
     }
 
     @objc private func selectOutput(_ sender: NSMenuItem) {
@@ -169,15 +131,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         viewModel.refresh()
     }
 
-    @objc private func toggleMute() {
-        router.toggleMute()
-        viewModel.refresh()
-    }
-
-    @objc private func openSoundSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")!)
-    }
-
     @objc private func toggleLaunchAtLogin() {
         do {
             if SMAppService.mainApp.status == .enabled {
@@ -193,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showError(_ message: String) {
         let alert = NSAlert()
-        alert.messageText = "Vol could not start"
+        alert.messageText = "Volidge could not start"
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
@@ -201,13 +154,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func requestAudioPermission() {
-        guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else { return }
-
-        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            guard !granted else { return }
-            DispatchQueue.main.async {
-                self?.showError("Microphone permission is required to receive audio from BlackHole. Enable Vol in Privacy & Security → Microphone, then reopen the app.")
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            startRoutingIfPossible()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        self?.startRoutingIfPossible()
+                    } else {
+                        self?.showError("Microphone permission is required to receive audio from Volidge. Enable Volidge in Privacy & Security → Microphone, then reopen the app.")
+                    }
+                }
             }
+        default:
+            showError("Microphone permission is required to receive audio from Volidge. Enable Volidge in Privacy & Security → Microphone, then reopen the app.")
+        }
+    }
+
+    private func startRoutingIfPossible() {
+        guard !router.isRunning else { return }
+        do {
+            try router.start()
+        } catch AudioRouterError.missingInputDevice {
+            viewModel.refresh()
+        } catch {
+            showError(error.localizedDescription)
         }
     }
 
@@ -229,12 +201,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let hostingView = NSHostingView(rootView: ControlPanel(model: viewModel))
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 405),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "Vol"
+        window.title = "Volidge"
         window.contentView = hostingView
         window.isReleasedWhenClosed = false
         window.center()

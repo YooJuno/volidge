@@ -7,12 +7,9 @@ import SwiftUI
 final class RouterViewModel: ObservableObject {
     private let router: AudioRouter
 
-    @Published private(set) var inputDevices: [AudioDevice] = []
     @Published private(set) var outputDevices: [AudioDevice] = []
-    @Published private(set) var selectedInputName = ""
     @Published private(set) var selectedOutputName = ""
     @Published private(set) var isRunning = false
-    @Published private(set) var isMuted = false
     @Published private(set) var status = ""
     @Published private(set) var launchAtLogin = false
     @Published var volume: Double = 0
@@ -24,20 +21,12 @@ final class RouterViewModel: ObservableObject {
     }
 
     func refresh() {
-        inputDevices = router.inputDevices
         outputDevices = router.outputDevices
-        selectedInputName = router.selectedInputName
         selectedOutputName = router.selectedOutputName
         isRunning = router.isRunning
-        isMuted = router.isMuted
         volume = Double(router.volume)
         status = router.statusDescription
         launchAtLogin = SMAppService.mainApp.status == .enabled
-    }
-
-    func selectInput(_ name: String) {
-        router.selectInput(named: name)
-        refresh()
     }
 
     func selectOutput(_ name: String) {
@@ -63,11 +52,6 @@ final class RouterViewModel: ObservableObject {
         refresh()
     }
 
-    func toggleMute() {
-        router.toggleMute()
-        refresh()
-    }
-
     func setLaunchAtLogin(_ enabled: Bool) {
         do {
             if enabled {
@@ -81,25 +65,22 @@ final class RouterViewModel: ObservableObject {
         refresh()
     }
 
-    func openSoundSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")!)
-    }
 }
 
 struct ControlPanel: View {
     @ObservedObject var model: RouterViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 12) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
                     .frame(width: 52, height: 52)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Vol")
+                    Text("Volidge")
                         .font(.system(size: 28, weight: .bold))
-                    Text("iD14 keyboard volume bridge")
+                    Text("Keyboard volume for your audio interface")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -108,25 +89,27 @@ struct ControlPanel: View {
                     .frame(width: 10, height: 10)
             }
 
-            VStack(spacing: 12) {
-                Picker("Virtual audio device", selection: inputBinding) {
-                    ForEach(model.inputDevices, id: \.name) { device in
-                        Text(device.name).tag(device.name)
-                    }
-                }
-                Picker("Play through", selection: outputBinding) {
-                    ForEach(model.outputDevices, id: \.name) { device in
-                        Text(device.name).tag(device.name)
-                    }
+            Picker("Output", selection: outputBinding) {
+                ForEach(model.outputDevices, id: \.name) { device in
+                    Text(device.name).tag(device.name)
                 }
             }
             .pickerStyle(.menu)
+
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(model.isRunning ? Color.green : Color.secondary)
+                    .frame(width: 7, height: 7)
+                Text(model.isRunning ? "Routing system audio to \(model.selectedOutputName)" : "Routing is paused")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Volume")
                     Spacer()
-                    Text("\(Int((model.isMuted ? 0 : model.volume) * 100))%")
+                    Text("\(Int(model.volume * 100))%")
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
@@ -137,28 +120,18 @@ struct ControlPanel: View {
                     .foregroundStyle(.secondary)
             }
 
-            Text(model.status)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-
             if let errorMessage = model.errorMessage {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(.red)
             }
 
-            HStack(spacing: 10) {
-                Button(model.isRunning ? "Stop Routing" : "Start Routing") {
+            HStack(spacing: 12) {
+                Button(model.isRunning ? "Stop" : "Start") {
                     model.toggleRouting()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
-
-                Button(model.isMuted ? "Unmute" : "Mute") {
-                    model.toggleMute()
-                }
-                .disabled(!model.isRunning)
 
                 Spacer()
 
@@ -167,26 +140,27 @@ struct ControlPanel: View {
                     .controlSize(.small)
             }
 
-            HStack {
-                Button("Sound Settings…") {
-                    model.openSoundSettings()
+            Divider()
+
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Coffee donation")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("3333063670931 · 카카오뱅크 유준호")
+                        .font(.caption)
+                        .textSelection(.enabled)
                 }
-                .buttonStyle(.link)
                 Spacer()
-                Text("BlackHole → iD14")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                Button("Copy account") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString("3333063670931", forType: .string)
+                }
+                .controlSize(.small)
             }
         }
         .padding(28)
-        .frame(width: 520)
-    }
-
-    private var inputBinding: Binding<String> {
-        Binding(
-            get: { model.selectedInputName },
-            set: { name in model.selectInput(name) }
-        )
+        .frame(width: 480)
     }
 
     private var outputBinding: Binding<String> {

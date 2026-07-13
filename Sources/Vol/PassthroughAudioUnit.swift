@@ -80,7 +80,7 @@ final class PassthroughAudioUnit: @unchecked Sendable {
                     &inputCallback,
                     UInt32(MemoryLayout<AURenderCallbackStruct>.size)
                 ),
-                "Setting the BlackHole input callback"
+                "Setting the Volidge input callback"
             )
 
             var outputCallback = AURenderCallbackStruct(
@@ -99,12 +99,12 @@ final class PassthroughAudioUnit: @unchecked Sendable {
                 "Setting the iD14 output callback"
             )
 
-            try check(AudioUnitInitialize(inputUnit), "Initialising BlackHole input")
+            try check(AudioUnitInitialize(inputUnit), "Initialising Volidge input")
             try check(AudioUnitInitialize(outputUnit), "Initialising iD14 output")
 
             self.inputUnit = inputUnit
             self.outputUnit = outputUnit
-            try check(AudioOutputUnitStart(inputUnit), "Starting BlackHole input")
+            try check(AudioOutputUnitStart(inputUnit), "Starting Volidge input")
             try check(AudioOutputUnitStart(outputUnit), "Starting iD14 output")
         } catch {
             AudioComponentInstanceDispose(inputUnit)
@@ -134,11 +134,11 @@ final class PassthroughAudioUnit: @unchecked Sendable {
 
     var diagnosticDescription: String {
         if captureCount.pointee == 0 {
-            return "BlackHole input callback did not run"
+            return "Volidge input callback did not run"
         }
         let inputStatus = OSStatus(lastCaptureStatus.pointee)
         if inputStatus != noErr {
-            return "BlackHole capture error \(inputStatus)"
+            return "Volidge capture error \(inputStatus)"
         }
         if renderCount.pointee == 0 {
             return "iD14 output callback did not run"
@@ -157,11 +157,11 @@ final class PassthroughAudioUnit: @unchecked Sendable {
         var format = format
         var maximumFramesPerSlice = UInt32(Self.maximumFramesPerSlice)
 
-        try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enabled, UInt32(MemoryLayout<UInt32>.size)), "Enabling BlackHole input")
-        try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disabled, UInt32(MemoryLayout<UInt32>.size)), "Disabling unused BlackHole output")
-        try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size)), "Selecting BlackHole")
-        try check(AudioUnitSetProperty(audioUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &format, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "Configuring BlackHole format")
-        try check(AudioUnitSetProperty(audioUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maximumFramesPerSlice, UInt32(MemoryLayout<UInt32>.size)), "Configuring BlackHole buffer size")
+        try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enabled, UInt32(MemoryLayout<UInt32>.size)), "Enabling Volidge input")
+        try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disabled, UInt32(MemoryLayout<UInt32>.size)), "Disabling unused Volidge output")
+        try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size)), "Selecting Volidge")
+        try check(AudioUnitSetProperty(audioUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &format, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "Configuring Volidge format")
+        try check(AudioUnitSetProperty(audioUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maximumFramesPerSlice, UInt32(MemoryLayout<UInt32>.size)), "Configuring Volidge buffer size")
     }
 
     private func configureOutput(
