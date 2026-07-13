@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import CoreAudio
 import Foundation
 
@@ -40,6 +41,12 @@ enum AudioRouterError: LocalizedError {
 
 @MainActor
 final class AudioRouter {
+    private struct OutputVolumeSnapshot {
+        let device: AudioDeviceID
+        let volume: Float
+        let isMuted: UInt32?
+    }
+
     private enum PreferenceKey {
         static let inputName = "inputDeviceName"
         static let outputName = "outputDeviceName"
@@ -53,9 +60,11 @@ final class AudioRouter {
     private var savedOutputDevice: AudioDeviceID?
     private var savedSystemOutputDevice: AudioDeviceID?
     private var savedVirtualDeviceSampleRate: Float64?
+    private var outputVolumeSnapshot: OutputVolumeSnapshot?
     private var volumeControl: AudioObjectID?
     private var systemVolumeListener: AudioObjectPropertyListenerBlock?
     private var volumeSyncTimer: Timer?
+    private var defaultDeviceListeners: [(AudioObjectPropertySelector, AudioObjectPropertyListenerBlock)] = []
 
     var onStateChange: (() -> Void)?
     private(set) var isRunning = false {
@@ -152,10 +161,21 @@ final class AudioRouter {
             throw AudioRouterError.unavailableAudioUnit
         }
 
-        savedOutputDevice = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice)
-        savedSystemOutputDevice = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        if savedOutputDevice == nil {
+            let currentOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice)
+            if currentOutput != inputDevice.id {
+                savedOutputDevice = currentOutput
+            }
+        }
+        if savedSystemOutputDevice == nil {
+            let currentSystemOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice)
+            if currentSystemOutput != inputDevice.id {
+                savedSystemOutputDevice = currentSystemOutput
+            }
+        }
 
         do {
+            normalizeOutputVolume(for: outputDevice.id)
             savedVirtualDeviceSampleRate = Self.nominalSampleRate(of: inputDevice.id)
             try Self.matchSampleRate(of: inputDevice.id, to: outputDevice.id)
             try Self.setDefaultDevice(inputDevice.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
@@ -169,6 +189,7 @@ final class AudioRouter {
             try bridge.start(inputDevice: inputDevice.id, outputDevice: outputDevice.id, sampleRate: sampleRate)
             installSystemVolumeListener(for: volumeControl)
             isRunning = true
+            installDefaultDeviceListeners(expectedDevice: inputDevice.id)
         } catch {
             stop(restoreSystemDevices: true)
             throw error
@@ -176,18 +197,32 @@ final class AudioRouter {
     }
 
     func stop(restoreSystemDevices: Bool) {
-        guard isRunning || savedOutputDevice != nil else { return }
+        stop(restoreSystemDevices: restoreSystemDevices, preserveSavedDevices: false)
+    }
+
+    private func stop(restoreSystemDevices: Bool, preserveSavedDevices: Bool) {
+        guard isRunning
+            || savedOutputDevice != nil
+            || savedSystemOutputDevice != nil
+            || outputVolumeSnapshot != nil else { return }
+        removeDefaultDeviceListeners()
         bridge.stop()
         removeSystemVolumeListener()
+        restoreOutputVolume()
         isRunning = false
 
-        guard restoreSystemDevices else { return }
-        restoreSavedDevices()
+        restoreVirtualDeviceSampleRate()
+        if restoreSystemDevices {
+            restoreSavedDevices()
+        } else if !preserveSavedDevices {
+            savedOutputDevice = nil
+            savedSystemOutputDevice = nil
+        }
     }
 
     private func restartIfNeeded() {
         guard isRunning else { return }
-        stop(restoreSystemDevices: true)
+        stop(restoreSystemDevices: false, preserveSavedDevices: true)
         try? start()
     }
 
@@ -196,18 +231,118 @@ final class AudioRouter {
     }
 
     private func restoreSavedDevices() {
-        if let savedOutputDevice {
-            try? Self.setDefaultDevice(savedOutputDevice, selector: kAudioHardwarePropertyDefaultOutputDevice)
+        let fallbackDevice = outputDevices.first(where: { $0.name == selectedOutputName })?.id
+        if let outputDevice = savedOutputDevice ?? fallbackDevice {
+            try? Self.setDefaultDevice(outputDevice, selector: kAudioHardwarePropertyDefaultOutputDevice)
         }
-        if let savedSystemOutputDevice {
-            try? Self.setDefaultDevice(savedSystemOutputDevice, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        if let systemOutputDevice = savedSystemOutputDevice ?? fallbackDevice {
+            try? Self.setDefaultDevice(systemOutputDevice, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
         }
         savedOutputDevice = nil
         savedSystemOutputDevice = nil
+    }
+
+    private func restoreVirtualDeviceSampleRate() {
         if let savedVirtualDeviceSampleRate, let virtualDevice = inputDevices.first(where: { $0.name == selectedInputName }) {
             try? Self.setNominalSampleRate(of: virtualDevice.id, to: savedVirtualDeviceSampleRate)
         }
         savedVirtualDeviceSampleRate = nil
+    }
+
+    private func normalizeOutputVolume(for device: AudioDeviceID) {
+        restoreOutputVolume()
+        guard let outputVolume = Self.virtualMainVolume(of: device) else { return }
+
+        outputVolumeSnapshot = OutputVolumeSnapshot(
+            device: device,
+            volume: outputVolume,
+            isMuted: Self.muteState(of: device)
+        )
+        try? Self.setVirtualMainVolume(of: device, to: 1)
+        try? Self.setMuteState(of: device, to: 0)
+    }
+
+    private func restoreOutputVolume() {
+        guard let snapshot = outputVolumeSnapshot else { return }
+        try? Self.setVirtualMainVolume(of: snapshot.device, to: snapshot.volume)
+        if let isMuted = snapshot.isMuted {
+            try? Self.setMuteState(of: snapshot.device, to: isMuted)
+        }
+        outputVolumeSnapshot = nil
+    }
+
+    private func installDefaultDeviceListeners(expectedDevice: AudioDeviceID) {
+        removeDefaultDeviceListeners()
+        let selectors: [AudioObjectPropertySelector] = [
+            kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioHardwarePropertyDefaultSystemOutputDevice,
+        ]
+
+        for selector in selectors {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    self?.handleDefaultDeviceChange(expectedDevice: expectedDevice)
+                }
+            }
+            let status = AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                .main,
+                listener
+            )
+            if status == noErr {
+                defaultDeviceListeners.append((selector, listener))
+            }
+        }
+
+        handleDefaultDeviceChange(expectedDevice: expectedDevice)
+    }
+
+    private func removeDefaultDeviceListeners() {
+        for (selector, listener) in defaultDeviceListeners {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                .main,
+                listener
+            )
+        }
+        defaultDeviceListeners.removeAll()
+    }
+
+    private func handleDefaultDeviceChange(expectedDevice: AudioDeviceID) {
+        guard isRunning else { return }
+        let defaultOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice)
+        let systemOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice)
+
+        if defaultOutput != expectedDevice {
+            let userSelectedDevice = defaultOutput
+            stop(restoreSystemDevices: false, preserveSavedDevices: false)
+            if let userSelectedDevice {
+                try? Self.setDefaultDevice(
+                    userSelectedDevice,
+                    selector: kAudioHardwarePropertyDefaultSystemOutputDevice
+                )
+            }
+            return
+        }
+
+        if systemOutput != expectedDevice {
+            try? Self.setDefaultDevice(
+                expectedDevice,
+                selector: kAudioHardwarePropertyDefaultSystemOutputDevice
+            )
+        }
     }
 
 
@@ -389,6 +524,74 @@ final class AudioRouter {
         )
         guard status == noErr else {
             throw AudioRouterError.coreAudio(status, "Changing the default audio device")
+        }
+    }
+
+    private static func virtualMainVolume(of device: AudioDeviceID) -> Float? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var volume: Float = 0
+        var dataSize = UInt32(MemoryLayout<Float>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, &volume) == noErr else {
+            return nil
+        }
+        return volume
+    }
+
+    private static func setVirtualMainVolume(of device: AudioDeviceID, to volume: Float) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var mutableVolume = min(max(volume, 0), 1)
+        let status = AudioObjectSetPropertyData(
+            device,
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<Float>.size),
+            &mutableVolume
+        )
+        guard status == noErr else {
+            throw AudioRouterError.coreAudio(status, "Normalising the output device volume")
+        }
+    }
+
+    private static func muteState(of device: AudioDeviceID) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var isMuted: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, &isMuted) == noErr else {
+            return nil
+        }
+        return isMuted
+    }
+
+    private static func setMuteState(of device: AudioDeviceID, to isMuted: UInt32) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var mutableMuteState = isMuted
+        let status = AudioObjectSetPropertyData(
+            device,
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<UInt32>.size),
+            &mutableMuteState
+        )
+        guard status == noErr else {
+            throw AudioRouterError.coreAudio(status, "Changing the output device mute state")
         }
     }
 

@@ -7,27 +7,12 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let router = AudioRouter()
     private lazy var viewModel = RouterViewModel(router: router)
-    private var mediaKeyMonitor: MediaKeyMonitor?
     private var controlWindow: NSWindow?
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
         enableLaunchAtLogin()
-
-        mediaKeyMonitor = MediaKeyMonitor { [weak self] key in
-            guard let self else { return }
-
-            switch key {
-            case .volumeUp:
-                self.router.adjustVolume(by: 0.05)
-            case .volumeDown:
-                self.router.adjustVolume(by: -0.05)
-            case .mute:
-                break
-            }
-        }
-        mediaKeyMonitor?.start()
 
         router.onStateChange = { [weak self] in
             self?.updateStatusTitle()
@@ -40,7 +25,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         router.stop(restoreSystemDevices: true)
-        mediaKeyMonitor?.stop()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -201,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let hostingView = NSHostingView(rootView: ControlPanel(model: viewModel))
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 405),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 445),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false

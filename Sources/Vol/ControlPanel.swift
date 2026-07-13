@@ -105,6 +105,16 @@ struct ControlPanel: View {
                     .foregroundStyle(.secondary)
             }
 
+            if model.isRunning {
+                Label(
+                    "The orange microphone indicator is macOS showing access to Volidge's virtual audio channel. Your Mac's microphone is not recorded.",
+                    systemImage: "waveform"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Volume")
