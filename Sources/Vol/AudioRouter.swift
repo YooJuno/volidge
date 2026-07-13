@@ -70,6 +70,9 @@ final class AudioRouter {
     private(set) var isRunning = false {
         didSet { notifyStateChange() }
     }
+    private(set) var isDirectOutput = false {
+        didSet { notifyStateChange() }
+    }
     private(set) var volume: Float {
         didSet {
             volume = min(max(volume, 0), 1)
@@ -115,10 +118,20 @@ final class AudioRouter {
     }
 
     var statusDescription: String {
+        if isDirectOutput {
+            return "Using (selectedOutputName) directly · no added latency"
+        }
         if isRunning {
             return "Routing Volidge → \(selectedOutputName) · \(bridge.diagnosticDescription)"
         }
         return "Stopped — choose devices, then start routing"
+    }
+
+    var requiresMicrophonePermission: Bool {
+        guard let outputDevice = outputDevices.first(where: { $0.name == selectedOutputName }) else {
+            return true
+        }
+        return Self.nativeOutputVolumeControl(for: outputDevice.id) == nil
     }
 
     func selectInput(named name: String) {
@@ -145,14 +158,31 @@ final class AudioRouter {
 
     func start() throws {
         guard !isRunning else { return }
+        guard let outputDevice = outputDevices.first(where: { $0.name == selectedOutputName }) else {
+            throw AudioRouterError.missingOutputDevice
+        }
+
+        if let directVolumeControl = Self.nativeOutputVolumeControl(for: outputDevice.id) {
+            saveCurrentDefaultDevices(excluding: outputDevice.id)
+            do {
+                try Self.setDefaultDevice(outputDevice.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
+                try Self.setDefaultDevice(outputDevice.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+                installSystemVolumeListener(for: directVolumeControl)
+                isDirectOutput = true
+                isRunning = true
+                installDefaultDeviceListeners(expectedDevice: outputDevice.id)
+                return
+            } catch {
+                stop(restoreSystemDevices: true)
+                throw error
+            }
+        }
+
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
             throw AudioRouterError.microphonePermissionRequired
         }
         guard let inputDevice = inputDevices.first(where: { $0.name == selectedInputName }) else {
             throw AudioRouterError.missingInputDevice
-        }
-        guard let outputDevice = outputDevices.first(where: { $0.name == selectedOutputName }) else {
-            throw AudioRouterError.missingOutputDevice
         }
         guard outputDevice.id != inputDevice.id else {
             throw AudioRouterError.virtualDeviceSelectedAsOutput
@@ -161,18 +191,7 @@ final class AudioRouter {
             throw AudioRouterError.unavailableAudioUnit
         }
 
-        if savedOutputDevice == nil {
-            let currentOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice)
-            if currentOutput != inputDevice.id {
-                savedOutputDevice = currentOutput
-            }
-        }
-        if savedSystemOutputDevice == nil {
-            let currentSystemOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice)
-            if currentSystemOutput != inputDevice.id {
-                savedSystemOutputDevice = currentSystemOutput
-            }
-        }
+        saveCurrentDefaultDevices(excluding: inputDevice.id)
 
         do {
             normalizeOutputVolume(for: outputDevice.id)
@@ -209,6 +228,7 @@ final class AudioRouter {
         bridge.stop()
         removeSystemVolumeListener()
         restoreOutputVolume()
+        isDirectOutput = false
         isRunning = false
 
         restoreVirtualDeviceSampleRate()
@@ -228,6 +248,21 @@ final class AudioRouter {
 
     private func notifyStateChange() {
         onStateChange?()
+    }
+
+    private func saveCurrentDefaultDevices(excluding activeDevice: AudioDeviceID) {
+        if savedOutputDevice == nil,
+           let currentOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice),
+           currentOutput != activeDevice,
+           Self.deviceName(for: currentOutput) != Self.virtualDeviceName {
+            savedOutputDevice = currentOutput
+        }
+        if savedSystemOutputDevice == nil,
+           let currentSystemOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice),
+           currentSystemOutput != activeDevice,
+           Self.deviceName(for: currentSystemOutput) != Self.virtualDeviceName {
+            savedSystemOutputDevice = currentSystemOutput
+        }
     }
 
     private func restoreSavedDevices() {
@@ -633,6 +668,24 @@ final class AudioRouter {
             }
             return volume(of: control) != nil
         }
+    }
+
+    private static func nativeOutputVolumeControl(for device: AudioDeviceID) -> AudioObjectID? {
+        guard virtualMainVolume(of: device) != nil,
+              let control = outputVolumeControl(for: device) else {
+            return nil
+        }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioLevelControlPropertyScalarValue,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var isSettable = DarwinBoolean(false)
+        guard AudioObjectIsPropertySettable(control, &address, &isSettable) == noErr,
+              isSettable.boolValue else {
+            return nil
+        }
+        return control
     }
 
     private static func volume(of control: AudioObjectID) -> Float? {

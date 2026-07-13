@@ -10,6 +10,7 @@ final class RouterViewModel: ObservableObject {
     @Published private(set) var outputDevices: [AudioDevice] = []
     @Published private(set) var selectedOutputName = ""
     @Published private(set) var isRunning = false
+    @Published private(set) var isDirectOutput = false
     @Published private(set) var status = ""
     @Published private(set) var launchAtLogin = false
     @Published var volume: Double = 0
@@ -24,6 +25,7 @@ final class RouterViewModel: ObservableObject {
         outputDevices = router.outputDevices
         selectedOutputName = router.selectedOutputName
         isRunning = router.isRunning
+        isDirectOutput = router.isDirectOutput
         volume = Double(router.volume)
         status = router.statusDescription
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -100,12 +102,12 @@ struct ControlPanel: View {
                 Circle()
                     .fill(model.isRunning ? Color.green : Color.secondary)
                     .frame(width: 7, height: 7)
-                Text(model.isRunning ? "Routing system audio to \(model.selectedOutputName)" : "Routing is paused")
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            if model.isRunning {
+            if model.isRunning && !model.isDirectOutput {
                 Label(
                     "The orange microphone indicator is macOS showing access to Volidge's virtual audio channel. Your Mac's microphone is not recorded.",
                     systemImage: "waveform"
@@ -178,6 +180,13 @@ struct ControlPanel: View {
             get: { model.selectedOutputName },
             set: { name in model.selectOutput(name) }
         )
+    }
+
+    private var statusText: String {
+        if model.isDirectOutput {
+            return "Using \(model.selectedOutputName) directly with no added latency"
+        }
+        return model.isRunning ? "Routing system audio to \(model.selectedOutputName)" : "Routing is paused"
     }
 
     private var volumeBinding: Binding<Double> {

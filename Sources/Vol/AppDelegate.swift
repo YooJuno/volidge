@@ -20,7 +20,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         updateStatusTitle()
         showControlWindow()
-        requestAudioPermission()
+        if router.requiresMicrophonePermission {
+            requestAudioPermission()
+        } else {
+            startRoutingIfPossible()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

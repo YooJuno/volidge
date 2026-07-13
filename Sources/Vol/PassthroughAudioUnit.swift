@@ -27,7 +27,7 @@ final class PassthroughAudioUnit: @unchecked Sendable {
     private let lastCaptureStatus = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
     private let inputStorage = UnsafeMutablePointer<Float>.allocate(capacity: maximumFramesPerSlice * 2)
     private let inputBufferList = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
-    private let ringBuffer = AudioRingBuffer(frameCapacity: 96_000)
+    private let ringBuffer = AudioRingBuffer(frameCapacity: 8_192)
 
     init() {
         gain.pointee = 0.7
@@ -312,6 +312,12 @@ private final class AudioRingBuffer: @unchecked Sendable {
         guard let output = buffers.first?.mData?.assumingMemoryBound(to: Float.self) else { return }
 
         lock.lock()
+        let maximumBufferedFrames = min(frameCapacity, max(frames * 2, 1_024))
+        if availableFrames > maximumBufferedFrames {
+            let framesToDiscard = availableFrames - maximumBufferedFrames
+            readFrame = (readFrame + framesToDiscard) % frameCapacity
+            availableFrames -= framesToDiscard
+        }
         let readableFrames = min(frames, availableFrames)
         for frame in 0 ..< readableFrames {
             let source = storage.advanced(by: readFrame * 2)

@@ -144,10 +144,10 @@ static Boolean								gBox_Acquired					= true;
 static pthread_mutex_t						gDevice_IOMutex					= PTHREAD_MUTEX_INITIALIZER;
 static Float64								gDevice_SampleRate				= 44100.0;
 static UInt64								gDevice_IOIsRunning				= 0;
-static const UInt32							kDevice_RingBufferSize			= 16384;
-static const UInt32							kDevice_LoopbackBufferFrames	= 65536;
-static const UInt32							kDevice_LoopbackFrameMask		= 65535;
-static Float32								gDevice_LoopbackBuffer[65536 * 2];
+static const UInt32							kDevice_RingBufferSize			= 512;
+static const UInt32							kDevice_LoopbackBufferFrames	= 8192;
+static const UInt32							kDevice_LoopbackFrameMask		= 8191;
+static Float32								gDevice_LoopbackBuffer[8192 * 2];
 static _Atomic UInt64							gDevice_LoopbackReadFrame		= 0;
 static _Atomic UInt64							gDevice_LoopbackWriteFrame		= 0;
 static const Float64							kDevice_SupportedSampleRates[] = { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
@@ -4167,6 +4167,12 @@ static OSStatus	NullAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 		UInt64 theReadFrame = atomic_load_explicit(&gDevice_LoopbackReadFrame, memory_order_relaxed);
 		UInt64 theWriteFrame = atomic_load_explicit(&gDevice_LoopbackWriteFrame, memory_order_acquire);
 		UInt64 theAvailableFrames = theWriteFrame - theReadFrame;
+		UInt64 theMaximumBufferedFrames = ((UInt64)inIOBufferFrameSize) * 2;
+		if(theAvailableFrames > theMaximumBufferedFrames)
+		{
+			theReadFrame = theWriteFrame - theMaximumBufferedFrames;
+			theAvailableFrames = theMaximumBufferedFrames;
+		}
 		UInt32 theFramesToCopy = (UInt32)((theAvailableFrames < inIOBufferFrameSize) ? theAvailableFrames : inIOBufferFrameSize);
 		for(UInt32 theFrameIndex = 0; theFrameIndex < theFramesToCopy; ++theFrameIndex)
 		{

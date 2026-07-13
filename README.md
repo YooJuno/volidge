@@ -12,21 +12,26 @@ Build the integrated installer:
 cd /Users/juno/Workspace/volidge
 chmod +x scripts/build_pkg.sh scripts/build_driver.sh
 scripts/build_pkg.sh
-open release/Volidge-1.1.0.pkg
+open release/Volidge-1.1.1.pkg
 ```
 
 The installer asks for an administrator password, installs `Volidge.app` in
 `/Applications`, installs `Volidge.driver` in
-`/Library/Audio/Plug-Ins/HAL`, restarts Core Audio, and opens Volidge. The first
-launch requests Microphone permission so Volidge can read its virtual audio
-input. macOS shows an orange microphone indicator while routing, but Volidge
-does not read the Mac's physical microphone.
+`/Library/Audio/Plug-Ins/HAL`, restarts Core Audio, and opens Volidge. When the
+selected device needs the audio bridge, the first launch requests Microphone
+permission so Volidge can read its virtual audio input. macOS shows an orange
+microphone indicator while bridging, but Volidge does not read the Mac's
+physical microphone.
 
 Choose the desired speaker or interface in Volidge. It becomes the destination
 while Volidge is the temporary system output. The destination's own volume is
 temporarily set to 100%, making Volidge the only volume stage, and is restored
 when routing stops. Changing the macOS output directly stops routing to prevent
 direct and delayed audio from playing together.
+
+AirPods and Mac speakers already support macOS volume control, so Volidge sends
+audio to them directly with no bridge, added latency, or microphone indicator.
+Interfaces such as the Audient iD14 use the low-latency bridge.
 
 `Volidge` supports stereo 32-bit float audio at 44.1, 48, 88.2, 96, 176.4,
 and 192 kHz. Volidge matches the device sample rate to the selected interface.
