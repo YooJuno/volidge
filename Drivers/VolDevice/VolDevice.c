@@ -1956,15 +1956,15 @@ static OSStatus	NullAudio_GetDevicePropertyDataSize(AudioServerPlugInDriverRef i
 			switch(inAddress->mScope)
 			{
 				case kAudioObjectPropertyScopeGlobal:
-					*outDataSize = 8 * sizeof(AudioObjectID);
+					*outDataSize = 3 * sizeof(AudioObjectID);
 					break;
 					
 				case kAudioObjectPropertyScopeInput:
-					*outDataSize = 4 * sizeof(AudioObjectID);
+					*outDataSize = 1 * sizeof(AudioObjectID);
 					break;
 					
 				case kAudioObjectPropertyScopeOutput:
-					*outDataSize = 4 * sizeof(AudioObjectID);
+					*outDataSize = 2 * sizeof(AudioObjectID);
 					break;
 			};
 			break;
@@ -2027,7 +2027,7 @@ static OSStatus	NullAudio_GetDevicePropertyDataSize(AudioServerPlugInDriverRef i
 			break;
 
 		case kAudioObjectPropertyControlList:
-			*outDataSize = 7 * sizeof(AudioObjectID);
+			*outDataSize = sizeof(AudioObjectID);
 			break;
 
 		case kAudioDevicePropertySafetyOffset:
@@ -2165,45 +2165,21 @@ static OSStatus	NullAudio_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
 			switch(inAddress->mScope)
 			{
 				case kAudioObjectPropertyScopeGlobal:
-					//	global scope means return all objects
-					if(theNumberItemsToFetch > 9)
-					{
-						theNumberItemsToFetch = 9;
-					}
-					
-					//	fill out the list with as many objects as requested, which is everything
-					for(theItemIndex = 0; theItemIndex < theNumberItemsToFetch; ++theItemIndex)
-					{
-						((AudioObjectID*)outData)[theItemIndex] = kObjectID_Stream_Input + theItemIndex;
-					}
+					if(theNumberItemsToFetch > 3) theNumberItemsToFetch = 3;
+					if(theNumberItemsToFetch > 0) ((AudioObjectID*)outData)[0] = kObjectID_Stream_Input;
+					if(theNumberItemsToFetch > 1) ((AudioObjectID*)outData)[1] = kObjectID_Stream_Output;
+					if(theNumberItemsToFetch > 2) ((AudioObjectID*)outData)[2] = kObjectID_Volume_Output_Master;
 					break;
 					
 				case kAudioObjectPropertyScopeInput:
-					//	input scope means just the objects on the input side
-					if(theNumberItemsToFetch > 4)
-					{
-						theNumberItemsToFetch = 4;
-					}
-					
-					//	fill out the list with the right objects
-					for(theItemIndex = 0; theItemIndex < theNumberItemsToFetch; ++theItemIndex)
-					{
-						((AudioObjectID*)outData)[theItemIndex] = kObjectID_Stream_Input + theItemIndex;
-					}
+					if(theNumberItemsToFetch > 1) theNumberItemsToFetch = 1;
+					if(theNumberItemsToFetch > 0) ((AudioObjectID*)outData)[0] = kObjectID_Stream_Input;
 					break;
 					
 				case kAudioObjectPropertyScopeOutput:
-					//	output scope means just the objects on the output side
-					if(theNumberItemsToFetch > 4)
-					{
-						theNumberItemsToFetch = 4;
-					}
-					
-					//	fill out the list with the right objects
-					for(theItemIndex = 0; theItemIndex < theNumberItemsToFetch; ++theItemIndex)
-					{
-						((AudioObjectID*)outData)[theItemIndex] = kObjectID_Stream_Output + theItemIndex;
-					}
+					if(theNumberItemsToFetch > 2) theNumberItemsToFetch = 2;
+					if(theNumberItemsToFetch > 0) ((AudioObjectID*)outData)[0] = kObjectID_Stream_Output;
+					if(theNumberItemsToFetch > 1) ((AudioObjectID*)outData)[1] = kObjectID_Volume_Output_Master;
 					break;
 			};
 			
@@ -2392,23 +2368,8 @@ static OSStatus	NullAudio_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
 			//	number is allowed to be smaller than the actual size of the list. In such
 			//	case, only that number of items will be returned
 			theNumberItemsToFetch = inDataSize / sizeof(AudioObjectID);
-			if(theNumberItemsToFetch > 7)
-			{
-				theNumberItemsToFetch = 7;
-			}
-			
-			//	fill out the list with as many objects as requested, which is everything
-			for(theItemIndex = 0; theItemIndex < theNumberItemsToFetch; ++theItemIndex)
-			{
-				if(theItemIndex < 3)
-				{
-					((AudioObjectID*)outData)[theItemIndex] = kObjectID_Volume_Input_Master + theItemIndex;
-				}
-				else
-				{
-					((AudioObjectID*)outData)[theItemIndex] = kObjectID_Volume_Output_Master + (theItemIndex - 3);
-				}
-			}
+			if(theNumberItemsToFetch > 1) theNumberItemsToFetch = 1;
+			if(theNumberItemsToFetch > 0) ((AudioObjectID*)outData)[0] = kObjectID_Volume_Output_Master;
 			
 			//	report how much we wrote
 			*outDataSize = theNumberItemsToFetch * sizeof(AudioObjectID);

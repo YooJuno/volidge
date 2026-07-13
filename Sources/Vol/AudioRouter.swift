@@ -128,6 +128,7 @@ final class AudioRouter {
 
     func setVolume(_ newVolume: Float) {
         volume = newVolume
+        bridge.setVolume(volume)
         guard isRunning, let volumeListenerDevice else { return }
         try? Self.setVolume(of: volumeListenerDevice, to: volume)
     }
@@ -157,7 +158,7 @@ final class AudioRouter {
             try Self.setDefaultDevice(inputDevice.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
             try Self.setVolume(of: inputDevice.id, to: volume)
 
-            bridge.setVolume(1)
+            bridge.setVolume(volume)
             guard let sampleRate = Self.nominalSampleRate(of: outputDevice.id) else {
                 throw AudioRouterError.unavailableAudioUnit
             }
@@ -240,6 +241,7 @@ final class AudioRouter {
     private func syncVolumeFromSystemDevice(_ device: AudioDeviceID) {
         guard let systemVolume = Self.volume(of: device) else { return }
         volume = systemVolume
+        bridge.setVolume(systemVolume)
     }
 
     private static var devices: [AudioDevice] {
