@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root="${0:A:h:h}"
 build_dir="$project_root/.build/release"
-app_dir="$project_root/dist/Vol.app"
+app_dir="$project_root/.build/export/Volidge.app"
 
 cd "$project_root"
 swift build --configuration release

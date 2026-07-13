@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -u
+
+target_volume="$3"
+/bin/rm -rf "$target_volume/Library/Audio/Plug-Ins/HAL/VolDevice.driver"
+/bin/rm -rf "$target_volume/Applications/Vol.app"
+exit 0
