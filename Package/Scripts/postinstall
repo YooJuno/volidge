@@ -2,7 +2,13 @@
 set -u
 
 /usr/bin/killall coreaudiod >/dev/null 2>&1 || true
-/bin/sleep 1
+
+for _ in {1..20}; do
+  if /usr/sbin/system_profiler SPAudioDataType 2>/dev/null | /usr/bin/grep -q 'Volidge:'; then
+    break
+  fi
+  /bin/sleep 0.25
+done
 
 console_user="$(/usr/bin/stat -f '%Su' /dev/console)"
 if [[ "$console_user" != "root" && "$console_user" != "loginwindow" ]]; then
@@ -15,6 +21,6 @@ if [[ "$console_user" != "root" && "$console_user" != "loginwindow" ]]; then
       fi
     fi
   done
-  /bin/launchctl asuser "$console_uid" /usr/bin/open "$3/Applications/Volidge.app" >/dev/null 2>&1 || true
+  /bin/launchctl asuser "$console_uid" /usr/bin/open -n "$3/Applications/Volidge.app" >/dev/null 2>&1 || true
 fi
 exit 0

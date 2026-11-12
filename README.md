@@ -12,7 +12,7 @@ Build the integrated installer:
 cd /Users/juno/Workspace/volidge
 chmod +x scripts/build_pkg.sh scripts/build_driver.sh
 scripts/build_pkg.sh
-open release/Volidge-1.1.1.pkg
+open release/Volidge-1.2.0.pkg
 ```
 
 The installer asks for an administrator password, installs `Volidge.app` in
@@ -32,6 +32,13 @@ direct and delayed audio from playing together.
 AirPods and Mac speakers already support macOS volume control, so Volidge sends
 audio to them directly with no bridge, added latency, or microphone indicator.
 Interfaces such as the Audient iD14 use the low-latency bridge.
+`Low latency` temporarily requests a 256-frame hardware buffer and restores the
+previous value when routing stops. Select `Compatibility` if another audio app
+requires the interface's existing buffer size.
+
+The bridge uses a lock-free buffer and continuously corrects small clock drift
+between the virtual device and the physical interface. Volidge also rebuilds
+the route after sleep, sample-rate changes, or USB reconnection.
 
 `Volidge` supports stereo 32-bit float audio at 44.1, 48, 88.2, 96, 176.4,
 and 192 kHz. Volidge matches the device sample rate to the selected interface.

@@ -4,7 +4,7 @@ set -euo pipefail
 project_root="${0:A:h:h}"
 package_root="$project_root/.build/package-root"
 release_dir="$project_root/release"
-version="1.1.1"
+version="1.2.0"
 package_path="$release_dir/Volidge-$version.pkg"
 
 zsh "$project_root/scripts/build_app.sh"
@@ -17,7 +17,7 @@ cp -R "$project_root/.build/export/Volidge.driver" "$package_root/Library/Audio/
 find "$package_root" -name '._*' -delete
 xattr -cr "$package_root"
 
-pkgbuild \
+COPYFILE_DISABLE=1 pkgbuild \
   --root "$package_root" \
   --component-plist "$project_root/Package/Component.plist" \
   --scripts "$project_root/Package/Scripts" \
