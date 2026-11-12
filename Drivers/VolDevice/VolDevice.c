@@ -17,9 +17,11 @@ A minimal user-space driver.
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <string.h>
 #include <sys/syslog.h>
 
 //==================================================================================================
@@ -147,7 +149,7 @@ static UInt64								gDevice_IOIsRunning				= 0;
 static const UInt32							kDevice_RingBufferSize			= 512;
 static const UInt32							kDevice_LoopbackBufferFrames	= 8192;
 static const UInt32							kDevice_LoopbackFrameMask		= 8191;
-static Float32								gDevice_LoopbackBuffer[8192 * 2];
+static _Atomic UInt32						gDevice_LoopbackBuffer[8192 * 2];
 static _Atomic UInt64							gDevice_LoopbackReadFrame		= 0;
 static _Atomic UInt64							gDevice_LoopbackWriteFrame		= 0;
 static const Float64							kDevice_SupportedSampleRates[] = { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
@@ -161,9 +163,9 @@ static bool									gStream_Input_IsActive			= true;
 static bool									gStream_Output_IsActive			= true;
 
 static const Float32						kVolume_MinDB					= -96.0;
-static const Float32						kVolume_MaxDB					= 6.0;
+static const Float32						kVolume_MaxDB					= 0.0;
 static Float32								gVolume_Input_Master_Value		= 0.0;
-static Float32								gVolume_Output_Master_Value		= 0.7;
+static Float32								gVolume_Output_Master_Value		= 0.7f;
 
 static bool									gMute_Input_Master_Value		= false;
 static bool									gMute_Output_Master_Value		= false;
@@ -173,6 +175,61 @@ static const UInt32							kDataSource_NumberItems			= 4;
 static UInt32								gDataSource_Input_Master_Value	= 0;
 static UInt32								gDataSource_Output_Master_Value	= 0;
 static UInt32								gDataDestination_PlayThru_Master_Value	= 0;
+
+static Float32 NullAudio_VolumeScalarToDecibels(Float32 inScalar)
+{
+	if(inScalar <= 0.0f)
+	{
+		return kVolume_MinDB;
+	}
+	if(inScalar >= 1.0f)
+	{
+		return kVolume_MaxDB;
+	}
+	Float32 theDecibels = 20.0f * log10f(inScalar);
+	return (theDecibels < kVolume_MinDB) ? kVolume_MinDB : theDecibels;
+}
+
+static Float32 NullAudio_VolumeDecibelsToScalar(Float32 inDecibels)
+{
+	if(inDecibels <= kVolume_MinDB)
+	{
+		return 0.0f;
+	}
+	if(inDecibels >= kVolume_MaxDB)
+	{
+		return 1.0f;
+	}
+	return powf(10.0f, inDecibels / 20.0f);
+}
+
+static UInt32 NullAudio_FloatToBits(Float32 inValue)
+{
+	UInt32 theBits;
+	memcpy(&theBits, &inValue, sizeof(theBits));
+	return theBits;
+}
+
+static Float32 NullAudio_BitsToFloat(UInt32 inBits)
+{
+	Float32 theValue;
+	memcpy(&theValue, &inBits, sizeof(theValue));
+	return theValue;
+}
+
+static void NullAudio_AdvanceLoopbackReadFrame(UInt64 inMinimumReadFrame)
+{
+	UInt64 theCurrentReadFrame = atomic_load_explicit(&gDevice_LoopbackReadFrame, memory_order_relaxed);
+	while((theCurrentReadFrame < inMinimumReadFrame) &&
+		!atomic_compare_exchange_weak_explicit(
+			&gDevice_LoopbackReadFrame,
+			&theCurrentReadFrame,
+			inMinimumReadFrame,
+			memory_order_release,
+			memory_order_relaxed))
+	{
+	}
+}
 
 //==================================================================================================
 #pragma mark -
@@ -556,7 +613,7 @@ static OSStatus	NullAudio_PerformDeviceConfigurationChange(AudioServerPlugInDriv
 	pthread_mutex_lock(&gPlugIn_StateMutex);
 	
 	//	change the sample rate
-	gDevice_SampleRate = inChangeAction;
+	gDevice_SampleRate = (Float64)inChangeAction;
 	
 	//	recalculate the state that depends on the sample rate
 	struct mach_timebase_info theTimeBaseInfo;
@@ -2410,7 +2467,7 @@ static OSStatus	NullAudio_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
 			}
 			
 			//	fill out the return array
-			for(UInt32 theItemIndex = 0; theItemIndex < theNumberItemsToFetch; ++theItemIndex)
+			for(theItemIndex = 0; theItemIndex < theNumberItemsToFetch; ++theItemIndex)
 			{
 				((AudioValueRange*)outData)[theItemIndex].mMinimum = kDevice_SupportedSampleRates[theItemIndex];
 				((AudioValueRange*)outData)[theItemIndex].mMaximum = kDevice_SupportedSampleRates[theItemIndex];
@@ -3411,10 +3468,7 @@ static OSStatus	NullAudio_GetControlPropertyData(AudioServerPlugInDriverRef inDr
 					*((Float32*)outData) = (inObjectID == kObjectID_Volume_Input_Master) ? gVolume_Input_Master_Value : gVolume_Output_Master_Value;
 					pthread_mutex_unlock(&gPlugIn_StateMutex);
 					
-					//	Note that we square the scalar value before converting to dB so as to
-					//	provide a better curve for the slider
-					*((Float32*)outData) *= *((Float32*)outData);
-					*((Float32*)outData) = kVolume_MinDB + (*((Float32*)outData) * (kVolume_MaxDB - kVolume_MinDB));
+					*((Float32*)outData) = NullAudio_VolumeScalarToDecibels(*((Float32*)outData));
 					
 					//	report how much we wrote
 					*outDataSize = sizeof(Float32);
@@ -3442,10 +3496,7 @@ static OSStatus	NullAudio_GetControlPropertyData(AudioServerPlugInDriverRef inDr
 						*((Float32*)outData) = 1.0;
 					}
 					
-					//	Note that we square the scalar value before converting to dB so as to
-					//	provide a better curve for the slider
-					*((Float32*)outData) *= *((Float32*)outData);
-					*((Float32*)outData) = kVolume_MinDB + (*((Float32*)outData) * (kVolume_MaxDB - kVolume_MinDB));
+					*((Float32*)outData) = NullAudio_VolumeScalarToDecibels(*((Float32*)outData));
 					
 					//	report how much we wrote
 					*outDataSize = sizeof(Float32);
@@ -3465,11 +3516,7 @@ static OSStatus	NullAudio_GetControlPropertyData(AudioServerPlugInDriverRef inDr
 						*((Float32*)outData) = kVolume_MaxDB;
 					}
 					
-					//	Note that we square the scalar value before converting to dB so as to
-					//	provide a better curve for the slider. We undo that here.
-					*((Float32*)outData) = *((Float32*)outData) - kVolume_MinDB;
-					*((Float32*)outData) /= kVolume_MaxDB - kVolume_MinDB;
-					*((Float32*)outData) = sqrtf(*((Float32*)outData));
+					*((Float32*)outData) = NullAudio_VolumeDecibelsToScalar(*((Float32*)outData));
 					
 					//	report how much we wrote
 					*outDataSize = sizeof(Float32);
@@ -3770,11 +3817,7 @@ static OSStatus	NullAudio_SetControlPropertyData(AudioServerPlugInDriverRef inDr
 					{
 						theNewVolume = kVolume_MaxDB;
 					}
-					//	Note that we square the scalar value before converting to dB so as to
-					//	provide a better curve for the slider. We undo that here.
-					theNewVolume = theNewVolume - kVolume_MinDB;
-					theNewVolume /= kVolume_MaxDB - kVolume_MinDB;
-					theNewVolume = sqrtf(theNewVolume);
+					theNewVolume = NullAudio_VolumeDecibelsToScalar(theNewVolume);
 					pthread_mutex_lock(&gPlugIn_StateMutex);
 					if(inObjectID == kObjectID_Volume_Input_Master)
 					{
@@ -4055,8 +4098,8 @@ static OSStatus	NullAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, 
 	}
 	
 	//	set the return values
-	*outSampleTime = gDevice_NumberTimeStamps * kDevice_RingBufferSize;
-	*outHostTime = gDevice_AnchorHostTime + (((Float64)gDevice_NumberTimeStamps) * theHostTicksPerRingBuffer);
+	*outSampleTime = (Float64)gDevice_NumberTimeStamps * (Float64)kDevice_RingBufferSize;
+	*outHostTime = gDevice_AnchorHostTime + (UInt64)(((Float64)gDevice_NumberTimeStamps) * theHostTicksPerRingBuffer);
 	*outSeed = 1;
 	
 	//	unlock the state lock
@@ -4151,23 +4194,23 @@ static OSStatus	NullAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 		if((theWriteFrame + inIOBufferFrameSize) - theReadFrame > kDevice_LoopbackBufferFrames)
 		{
 			theReadFrame = theWriteFrame + inIOBufferFrameSize - kDevice_LoopbackBufferFrames;
-			atomic_store_explicit(&gDevice_LoopbackReadFrame, theReadFrame, memory_order_release);
+			NullAudio_AdvanceLoopbackReadFrame(theReadFrame);
 		}
 		for(UInt32 theFrameIndex = 0; theFrameIndex < inIOBufferFrameSize; ++theFrameIndex)
 		{
 			UInt32 theBufferFrame = (UInt32)((theWriteFrame + theFrameIndex) & kDevice_LoopbackFrameMask);
-			gDevice_LoopbackBuffer[theBufferFrame * 2] = theSource[theFrameIndex * 2];
-			gDevice_LoopbackBuffer[theBufferFrame * 2 + 1] = theSource[theFrameIndex * 2 + 1];
+			atomic_store_explicit(&gDevice_LoopbackBuffer[theBufferFrame * 2], NullAudio_FloatToBits(theSource[theFrameIndex * 2]), memory_order_relaxed);
+			atomic_store_explicit(&gDevice_LoopbackBuffer[theBufferFrame * 2 + 1], NullAudio_FloatToBits(theSource[theFrameIndex * 2 + 1]), memory_order_relaxed);
 		}
 		atomic_store_explicit(&gDevice_LoopbackWriteFrame, theWriteFrame + inIOBufferFrameSize, memory_order_release);
 	}
 	else if(inOperationID == kAudioServerPlugInIOOperationReadInput)
 	{
 		Float32* theDestination = (Float32*)ioMainBuffer;
-		UInt64 theReadFrame = atomic_load_explicit(&gDevice_LoopbackReadFrame, memory_order_relaxed);
+		UInt64 theReadFrame = atomic_load_explicit(&gDevice_LoopbackReadFrame, memory_order_acquire);
 		UInt64 theWriteFrame = atomic_load_explicit(&gDevice_LoopbackWriteFrame, memory_order_acquire);
 		UInt64 theAvailableFrames = theWriteFrame - theReadFrame;
-		UInt64 theMaximumBufferedFrames = ((UInt64)inIOBufferFrameSize) * 2;
+		UInt64 theMaximumBufferedFrames = (UInt64)inIOBufferFrameSize;
 		if(theAvailableFrames > theMaximumBufferedFrames)
 		{
 			theReadFrame = theWriteFrame - theMaximumBufferedFrames;
@@ -4177,14 +4220,14 @@ static OSStatus	NullAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 		for(UInt32 theFrameIndex = 0; theFrameIndex < theFramesToCopy; ++theFrameIndex)
 		{
 			UInt32 theBufferFrame = (UInt32)((theReadFrame + theFrameIndex) & kDevice_LoopbackFrameMask);
-			theDestination[theFrameIndex * 2] = gDevice_LoopbackBuffer[theBufferFrame * 2];
-			theDestination[theFrameIndex * 2 + 1] = gDevice_LoopbackBuffer[theBufferFrame * 2 + 1];
+			theDestination[theFrameIndex * 2] = NullAudio_BitsToFloat(atomic_load_explicit(&gDevice_LoopbackBuffer[theBufferFrame * 2], memory_order_relaxed));
+			theDestination[theFrameIndex * 2 + 1] = NullAudio_BitsToFloat(atomic_load_explicit(&gDevice_LoopbackBuffer[theBufferFrame * 2 + 1], memory_order_relaxed));
 		}
 		if(theFramesToCopy < inIOBufferFrameSize)
 		{
 			memset(theDestination + theFramesToCopy * 2, 0, (inIOBufferFrameSize - theFramesToCopy) * 8);
 		}
-		atomic_store_explicit(&gDevice_LoopbackReadFrame, theReadFrame + theFramesToCopy, memory_order_release);
+		NullAudio_AdvanceLoopbackReadFrame(theReadFrame + theFramesToCopy);
 	}
 
 Done:
