@@ -5,9 +5,24 @@ import Foundation
 
 struct AudioDevice: Identifiable, Equatable {
     let id: AudioDeviceID
+    let uid: String
     let name: String
 
     var identifier: AudioDeviceID { id }
+}
+
+enum AudioLatencyMode: String, CaseIterable, Identifiable {
+    case low
+    case compatible
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .low: return "Low latency"
+        case .compatible: return "Compatibility"
+        }
+    }
 }
 
 enum AudioRouterError: LocalizedError {
@@ -41,32 +56,90 @@ enum AudioRouterError: LocalizedError {
 
 @MainActor
 final class AudioRouter {
+    private enum VolumeEndpoint {
+        case control(AudioObjectID)
+        case virtualMain(AudioDeviceID)
+
+        var objectID: AudioObjectID {
+            switch self {
+            case let .control(objectID), let .virtualMain(objectID): return objectID
+            }
+        }
+
+        var address: AudioObjectPropertyAddress {
+            switch self {
+            case .control:
+                return AudioObjectPropertyAddress(
+                    mSelector: kAudioLevelControlPropertyScalarValue,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+            case .virtualMain:
+                return AudioObjectPropertyAddress(
+                    mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+                    mScope: kAudioObjectPropertyScopeOutput,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+            }
+        }
+    }
+
+    private struct PropertyListener {
+        let objectID: AudioObjectID
+        let address: AudioObjectPropertyAddress
+        let block: AudioObjectPropertyListenerBlock
+    }
+
     private struct OutputVolumeSnapshot {
-        let device: AudioDeviceID
+        let deviceUID: String
         let volume: Float
         let isMuted: UInt32?
+    }
+
+    private struct OutputBufferSnapshot {
+        let deviceUID: String
+        let frameSize: UInt32
     }
 
     private enum PreferenceKey {
         static let inputName = "inputDeviceName"
         static let outputName = "outputDeviceName"
+        static let outputUID = "outputDeviceUID"
         static let volume = "volume"
+        static let latencyMode = "latencyMode"
+        static let savedOutputUID = "savedDefaultOutputUID"
+        static let savedSystemOutputUID = "savedDefaultSystemOutputUID"
+        static let volumeSnapshotUID = "outputVolumeSnapshotUID"
+        static let volumeSnapshotValue = "outputVolumeSnapshotValue"
+        static let volumeSnapshotMute = "outputVolumeSnapshotMute"
     }
 
     private static let virtualDeviceName = "Volidge"
     private static let legacyVirtualDeviceName = "VolDevice"
 
     private let bridge = PassthroughAudioUnit()
-    private var savedOutputDevice: AudioDeviceID?
-    private var savedSystemOutputDevice: AudioDeviceID?
+    private var savedOutputDeviceUID: String?
+    private var savedSystemOutputDeviceUID: String?
     private var savedVirtualDeviceSampleRate: Float64?
     private var outputVolumeSnapshot: OutputVolumeSnapshot?
-    private var volumeControl: AudioObjectID?
+    private var outputBufferSnapshot: OutputBufferSnapshot?
+    private var volumeEndpoint: VolumeEndpoint?
     private var systemVolumeListener: AudioObjectPropertyListenerBlock?
     private var volumeSyncTimer: Timer?
     private var defaultDeviceListeners: [(AudioObjectPropertySelector, AudioObjectPropertyListenerBlock)] = []
+    private var hardwareDeviceListener: PropertyListener?
+    private var activeDeviceListeners: [PropertyListener] = []
+    private var recoveryTask: Task<Void, Never>?
+    private var routeHealthTimer: Timer?
+    private var lastBridgeHealth: PassthroughAudioHealth?
+    private var unhealthyHealthChecks = 0
+    private var activeInputDeviceID: AudioDeviceID?
+    private var activeOutputDeviceID: AudioDeviceID?
+    private var routingRequested = false
+    private var isSuspended = false
 
     var onStateChange: (() -> Void)?
+    var onError: ((String) -> Void)?
     private(set) var isRunning = false {
         didSet { notifyStateChange() }
     }
@@ -84,24 +157,55 @@ final class AudioRouter {
     private(set) var selectedInputName: String {
         didSet { UserDefaults.standard.set(selectedInputName, forKey: PreferenceKey.inputName) }
     }
+    private(set) var selectedOutputUID: String {
+        didSet { UserDefaults.standard.set(selectedOutputUID, forKey: PreferenceKey.outputUID) }
+    }
     private(set) var selectedOutputName: String {
         didSet { UserDefaults.standard.set(selectedOutputName, forKey: PreferenceKey.outputName) }
     }
+    private(set) var latencyMode: AudioLatencyMode {
+        didSet {
+            UserDefaults.standard.set(latencyMode.rawValue, forKey: PreferenceKey.latencyMode)
+            notifyStateChange()
+        }
+    }
 
     init() {
-        let defaultOutput = Self.defaultDeviceName(for: kAudioHardwarePropertyDefaultOutputDevice)
+        let availableOutputs = Self.outputDeviceList
+        let defaultOutputID = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice)
+        let defaultOutput = defaultOutputID.flatMap { id in availableOutputs.first { $0.id == id } }
         selectedInputName = Self.firstDeviceName(containing: "volidge", requiringInput: true)
             ?? Self.virtualDeviceName
+        let savedOutputUID = UserDefaults.standard.string(forKey: PreferenceKey.outputUID)
         let savedOutputName = UserDefaults.standard.string(forKey: PreferenceKey.outputName)
-        let preferredOutputName: String? = savedOutputName == Self.virtualDeviceName
-            ? nil
-            : savedOutputName
-        selectedOutputName = preferredOutputName
-            ?? Self.firstDeviceName(containing: "audient", requiringInput: false)
-            ?? Self.firstDeviceName(containing: "id14", requiringInput: false)
-            ?? (defaultOutput == Self.virtualDeviceName ? nil : defaultOutput)
-            ?? "iD14 MKII"
+        let savedOutput = availableOutputs.first { $0.uid == savedOutputUID }
+            ?? availableOutputs.first { $0.name == savedOutputName && $0.name != Self.virtualDeviceName }
+        let fallbackOutput = availableOutputs.first { $0.name.localizedCaseInsensitiveContains("audient") }
+            ?? availableOutputs.first { $0.name.localizedCaseInsensitiveContains("id14") }
+            ?? defaultOutput
+            ?? availableOutputs.first
+        if let savedOutputUID, !savedOutputUID.isEmpty {
+            selectedOutputUID = savedOutputUID
+            selectedOutputName = savedOutput?.name ?? savedOutputName ?? "Audio output"
+        } else if let savedOutputName, savedOutputName != Self.virtualDeviceName {
+            selectedOutputUID = savedOutput?.uid ?? ""
+            selectedOutputName = savedOutputName
+        } else {
+            selectedOutputUID = fallbackOutput?.uid ?? ""
+            selectedOutputName = fallbackOutput?.name ?? "Audio output"
+        }
         volume = UserDefaults.standard.object(forKey: PreferenceKey.volume) as? Float ?? 0.7
+        latencyMode = AudioLatencyMode(
+            rawValue: UserDefaults.standard.string(forKey: PreferenceKey.latencyMode) ?? ""
+        ) ?? .low
+        savedOutputDeviceUID = UserDefaults.standard.string(forKey: PreferenceKey.savedOutputUID)
+        savedSystemOutputDeviceUID = UserDefaults.standard.string(forKey: PreferenceKey.savedSystemOutputUID)
+        UserDefaults.standard.set(selectedInputName, forKey: PreferenceKey.inputName)
+        UserDefaults.standard.set(selectedOutputUID, forKey: PreferenceKey.outputUID)
+        UserDefaults.standard.set(selectedOutputName, forKey: PreferenceKey.outputName)
+        UserDefaults.standard.set(latencyMode.rawValue, forKey: PreferenceKey.latencyMode)
+        recoverPersistedOutputVolume()
+        installHardwareDeviceListener()
     }
 
     var inputDevices: [AudioDevice] {
@@ -109,17 +213,17 @@ final class AudioRouter {
     }
 
     var outputDevices: [AudioDevice] {
-        Self.devices.filter {
-            $0.name != Self.virtualDeviceName
-                && $0.name != Self.legacyVirtualDeviceName
-                && Self.hasChannels($0.id, scope: kAudioObjectPropertyScopeOutput)
-                && !Self.isMicrophone($0.name)
-        }
+        Self.outputDeviceList
+    }
+
+    private var selectedOutputDevice: AudioDevice? {
+        outputDevices.first { $0.uid == selectedOutputUID }
+            ?? outputDevices.first { $0.name == selectedOutputName }
     }
 
     var statusDescription: String {
         if isDirectOutput {
-            return "Using (selectedOutputName) directly · no added latency"
+            return "Using \(selectedOutputName) directly · no added latency"
         }
         if isRunning {
             return "Routing Volidge → \(selectedOutputName) · \(bridge.diagnosticDescription)"
@@ -128,20 +232,27 @@ final class AudioRouter {
     }
 
     var requiresMicrophonePermission: Bool {
-        guard let outputDevice = outputDevices.first(where: { $0.name == selectedOutputName }) else {
+        guard let outputDevice = selectedOutputDevice else {
             return true
         }
-        return Self.nativeOutputVolumeControl(for: outputDevice.id) == nil
+        return !Self.hasNativeOutputVolume(for: outputDevice.id)
     }
 
-    func selectInput(named name: String) {
-        selectedInputName = name
+    var selectedOutputUsesBridge: Bool {
+        guard let outputDevice = selectedOutputDevice else { return true }
+        return !Self.hasNativeOutputVolume(for: outputDevice.id)
+    }
+
+    func selectOutput(uid: String) {
+        guard let device = outputDevices.first(where: { $0.uid == uid }) else { return }
+        selectedOutputUID = device.uid
+        selectedOutputName = device.name
         restartIfNeeded()
     }
 
-    func selectOutput(named name: String) {
-        guard name != Self.virtualDeviceName else { return }
-        selectedOutputName = name
+    func setLatencyMode(_ mode: AudioLatencyMode) {
+        guard latencyMode != mode else { return }
+        latencyMode = mode
         restartIfNeeded()
     }
 
@@ -152,25 +263,33 @@ final class AudioRouter {
     func setVolume(_ newVolume: Float) {
         volume = newVolume
         bridge.setVolume(volume)
-        guard isRunning, let volumeControl else { return }
-        try? Self.setVolume(of: volumeControl, to: volume)
+        guard isRunning, let volumeEndpoint else { return }
+        try? Self.setVolume(of: volumeEndpoint, to: volume)
     }
 
     func start() throws {
+        routingRequested = true
+        try startRoute()
+    }
+
+    private func startRoute() throws {
         guard !isRunning else { return }
-        guard let outputDevice = outputDevices.first(where: { $0.name == selectedOutputName }) else {
+        guard !isSuspended else { return }
+        guard let outputDevice = selectedOutputDevice else {
             throw AudioRouterError.missingOutputDevice
         }
 
-        if let directVolumeControl = Self.nativeOutputVolumeControl(for: outputDevice.id) {
+        if Self.hasNativeOutputVolume(for: outputDevice.id) {
             saveCurrentDefaultDevices(excluding: outputDevice.id)
             do {
                 try Self.setDefaultDevice(outputDevice.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
                 try Self.setDefaultDevice(outputDevice.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
-                installSystemVolumeListener(for: directVolumeControl)
+                installSystemVolumeListener(for: .virtualMain(outputDevice.id))
                 isDirectOutput = true
                 isRunning = true
+                activeOutputDeviceID = outputDevice.id
                 installDefaultDeviceListeners(expectedDevice: outputDevice.id)
+                installActiveDeviceListeners(inputDevice: nil, outputDevice: outputDevice.id)
                 return
             } catch {
                 stop(restoreSystemDevices: true)
@@ -194,6 +313,7 @@ final class AudioRouter {
         saveCurrentDefaultDevices(excluding: inputDevice.id)
 
         do {
+            optimizeOutputBuffer(for: outputDevice)
             normalizeOutputVolume(for: outputDevice.id)
             savedVirtualDeviceSampleRate = Self.nominalSampleRate(of: inputDevice.id)
             try Self.matchSampleRate(of: inputDevice.id, to: outputDevice.id)
@@ -206,9 +326,13 @@ final class AudioRouter {
                 throw AudioRouterError.unavailableAudioUnit
             }
             try bridge.start(inputDevice: inputDevice.id, outputDevice: outputDevice.id, sampleRate: sampleRate)
-            installSystemVolumeListener(for: volumeControl)
+            installSystemVolumeListener(for: .control(volumeControl))
             isRunning = true
+            activeInputDeviceID = inputDevice.id
+            activeOutputDeviceID = outputDevice.id
             installDefaultDeviceListeners(expectedDevice: inputDevice.id)
+            installActiveDeviceListeners(inputDevice: inputDevice.id, outputDevice: outputDevice.id)
+            startRouteHealthMonitoring()
         } catch {
             stop(restoreSystemDevices: true)
             throw error
@@ -216,65 +340,275 @@ final class AudioRouter {
     }
 
     func stop(restoreSystemDevices: Bool) {
+        routingRequested = false
+        recoveryTask?.cancel()
         stop(restoreSystemDevices: restoreSystemDevices, preserveSavedDevices: false)
     }
 
     private func stop(restoreSystemDevices: Bool, preserveSavedDevices: Bool) {
         guard isRunning
-            || savedOutputDevice != nil
-            || savedSystemOutputDevice != nil
-            || outputVolumeSnapshot != nil else { return }
+            || savedOutputDeviceUID != nil
+            || savedSystemOutputDeviceUID != nil
+            || savedVirtualDeviceSampleRate != nil
+            || outputVolumeSnapshot != nil
+            || outputBufferSnapshot != nil
+            || !activeDeviceListeners.isEmpty else { return }
         removeDefaultDeviceListeners()
+        removeActiveDeviceListeners()
+        stopRouteHealthMonitoring()
         bridge.stop()
         removeSystemVolumeListener()
         restoreOutputVolume()
+        restoreOutputBuffer()
         isDirectOutput = false
         isRunning = false
+        activeInputDeviceID = nil
+        activeOutputDeviceID = nil
 
         restoreVirtualDeviceSampleRate()
         if restoreSystemDevices {
             restoreSavedDevices()
         } else if !preserveSavedDevices {
-            savedOutputDevice = nil
-            savedSystemOutputDevice = nil
+            clearSavedDevices()
         }
     }
 
     private func restartIfNeeded() {
-        guard isRunning else { return }
-        stop(restoreSystemDevices: false, preserveSavedDevices: true)
-        try? start()
+        guard routingRequested else { return }
+        if isRunning {
+            stop(restoreSystemDevices: false, preserveSavedDevices: true)
+        }
+        do {
+            try startRoute()
+        } catch {
+            onError?(error.localizedDescription)
+            notifyStateChange()
+        }
+    }
+
+    func suspendForSleep() {
+        isSuspended = true
+        recoveryTask?.cancel()
+        if isRunning {
+            stop(restoreSystemDevices: true, preserveSavedDevices: false)
+        }
+    }
+
+    func resumeAfterWake() {
+        isSuspended = false
+        scheduleRouteRecovery(delay: 1.0)
+    }
+
+    func shutdown() {
+        routingRequested = false
+        recoveryTask?.cancel()
+        removeHardwareDeviceListener()
+        stop(restoreSystemDevices: true, preserveSavedDevices: false)
     }
 
     private func notifyStateChange() {
         onStateChange?()
     }
 
+    private func startRouteHealthMonitoring() {
+        stopRouteHealthMonitoring()
+        lastBridgeHealth = bridge.healthSnapshot
+        unhealthyHealthChecks = 0
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkRouteHealth()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        routeHealthTimer = timer
+    }
+
+    private func stopRouteHealthMonitoring() {
+        routeHealthTimer?.invalidate()
+        routeHealthTimer = nil
+        lastBridgeHealth = nil
+        unhealthyHealthChecks = 0
+    }
+
+    private func checkRouteHealth() {
+        guard isRunning, !isDirectOutput else {
+            stopRouteHealthMonitoring()
+            return
+        }
+        let health = bridge.healthSnapshot
+        let callbacksStopped = lastBridgeHealth.map {
+            $0.captureCount == health.captureCount || $0.renderCount == health.renderCount
+        } ?? false
+        let excessiveUnderflow = lastBridgeHealth.map {
+            health.underflowFrames &- $0.underflowFrames > 4_096
+        } ?? false
+        let unhealthy = health.captureStatus != noErr || callbacksStopped || excessiveUnderflow
+        unhealthyHealthChecks = unhealthy ? unhealthyHealthChecks + 1 : 0
+        lastBridgeHealth = health
+
+        guard unhealthyHealthChecks >= 2 else { return }
+        activeOutputDeviceID = nil
+        stopRouteHealthMonitoring()
+        scheduleRouteRecovery(delay: 0.1)
+    }
+
+    private func installHardwareDeviceListener() {
+        removeHardwareDeviceListener()
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.handleHardwareDeviceListChange()
+            }
+        }
+        let objectID = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectAddPropertyListenerBlock(objectID, &address, .main, listener) == noErr else {
+            return
+        }
+        hardwareDeviceListener = PropertyListener(objectID: objectID, address: address, block: listener)
+    }
+
+    private func removeHardwareDeviceListener() {
+        guard let listener = hardwareDeviceListener else { return }
+        var address = listener.address
+        AudioObjectRemovePropertyListenerBlock(listener.objectID, &address, .main, listener.block)
+        hardwareDeviceListener = nil
+    }
+
+    private func installActiveDeviceListeners(inputDevice: AudioDeviceID?, outputDevice: AudioDeviceID) {
+        removeActiveDeviceListeners()
+        let selectors: [AudioObjectPropertySelector] = [
+            kAudioDevicePropertyDeviceIsAlive,
+            kAudioDevicePropertyNominalSampleRate,
+            kAudioDevicePropertyBufferFrameSize,
+        ]
+        let deviceIDs = [inputDevice, outputDevice].compactMap { $0 }
+
+        for deviceID in deviceIDs {
+            for selector in selectors {
+                var address = AudioObjectPropertyAddress(
+                    mSelector: selector,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                guard AudioObjectHasProperty(deviceID, &address) else { continue }
+                let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        self?.activeOutputDeviceID = nil
+                        self?.scheduleRouteRecovery(delay: 0.25)
+                    }
+                }
+                guard AudioObjectAddPropertyListenerBlock(deviceID, &address, .main, listener) == noErr else {
+                    continue
+                }
+                activeDeviceListeners.append(
+                    PropertyListener(objectID: deviceID, address: address, block: listener)
+                )
+            }
+        }
+    }
+
+    private func removeActiveDeviceListeners() {
+        for listener in activeDeviceListeners {
+            var address = listener.address
+            AudioObjectRemovePropertyListenerBlock(listener.objectID, &address, .main, listener.block)
+        }
+        activeDeviceListeners.removeAll()
+    }
+
+    private func handleHardwareDeviceListChange() {
+        if let selectedDevice = outputDevices.first(where: { $0.uid == selectedOutputUID })
+            ?? (selectedOutputUID.isEmpty
+                ? outputDevices.first(where: { $0.name == selectedOutputName })
+                : nil) {
+            selectedOutputUID = selectedDevice.uid
+            selectedOutputName = selectedDevice.name
+        }
+        if !isRunning, outputVolumeSnapshot != nil {
+            restoreOutputVolume()
+        }
+        notifyStateChange()
+        scheduleRouteRecovery(delay: 0.5)
+    }
+
+    private func scheduleRouteRecovery(delay: TimeInterval) {
+        guard routingRequested, !isSuspended else { return }
+        recoveryTask?.cancel()
+        recoveryTask = Task { @MainActor [weak self] in
+            let nanoseconds = UInt64(max(delay, 0) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            self?.recoverRouteIfNeeded()
+        }
+    }
+
+    private func recoverRouteIfNeeded() {
+        guard routingRequested, !isSuspended, let outputDevice = selectedOutputDevice else {
+            if isRunning {
+                stop(restoreSystemDevices: true, preserveSavedDevices: false)
+            }
+            return
+        }
+
+        let inputDevice = inputDevices.first(where: { $0.name == selectedInputName })
+        let activeRouteChanged = activeOutputDeviceID != outputDevice.id
+            || (!isDirectOutput && activeInputDeviceID != inputDevice?.id)
+        if isRunning, !activeRouteChanged {
+            return
+        }
+        if isRunning {
+            stop(restoreSystemDevices: false, preserveSavedDevices: true)
+        }
+        do {
+            try startRoute()
+        } catch {
+            onError?(error.localizedDescription)
+            notifyStateChange()
+        }
+    }
+
     private func saveCurrentDefaultDevices(excluding activeDevice: AudioDeviceID) {
-        if savedOutputDevice == nil,
+        if savedOutputDeviceUID == nil,
            let currentOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice),
            currentOutput != activeDevice,
-           Self.deviceName(for: currentOutput) != Self.virtualDeviceName {
-            savedOutputDevice = currentOutput
+           Self.deviceName(for: currentOutput) != Self.virtualDeviceName,
+           let uid = Self.deviceUID(for: currentOutput) {
+            savedOutputDeviceUID = uid
+            UserDefaults.standard.set(uid, forKey: PreferenceKey.savedOutputUID)
         }
-        if savedSystemOutputDevice == nil,
+        if savedSystemOutputDeviceUID == nil,
            let currentSystemOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice),
            currentSystemOutput != activeDevice,
-           Self.deviceName(for: currentSystemOutput) != Self.virtualDeviceName {
-            savedSystemOutputDevice = currentSystemOutput
+           Self.deviceName(for: currentSystemOutput) != Self.virtualDeviceName,
+           let uid = Self.deviceUID(for: currentSystemOutput) {
+            savedSystemOutputDeviceUID = uid
+            UserDefaults.standard.set(uid, forKey: PreferenceKey.savedSystemOutputUID)
         }
     }
 
     private func restoreSavedDevices() {
-        let fallbackDevice = outputDevices.first(where: { $0.name == selectedOutputName })?.id
+        let fallbackDevice = selectedOutputDevice?.id
+            ?? outputDevices.first { $0.uid == "BuiltInSpeakerDevice" }?.id
+            ?? outputDevices.first?.id
+        let savedOutputDevice = savedOutputDeviceUID.flatMap(Self.device(withUID:))
+        let savedSystemOutputDevice = savedSystemOutputDeviceUID.flatMap(Self.device(withUID:))
         if let outputDevice = savedOutputDevice ?? fallbackDevice {
             try? Self.setDefaultDevice(outputDevice, selector: kAudioHardwarePropertyDefaultOutputDevice)
         }
         if let systemOutputDevice = savedSystemOutputDevice ?? fallbackDevice {
             try? Self.setDefaultDevice(systemOutputDevice, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
         }
-        savedOutputDevice = nil
-        savedSystemOutputDevice = nil
+        clearSavedDevices()
+    }
+
+    private func clearSavedDevices() {
+        savedOutputDeviceUID = nil
+        savedSystemOutputDeviceUID = nil
+        UserDefaults.standard.removeObject(forKey: PreferenceKey.savedOutputUID)
+        UserDefaults.standard.removeObject(forKey: PreferenceKey.savedSystemOutputUID)
     }
 
     private func restoreVirtualDeviceSampleRate() {
@@ -286,24 +620,89 @@ final class AudioRouter {
 
     private func normalizeOutputVolume(for device: AudioDeviceID) {
         restoreOutputVolume()
-        guard let outputVolume = Self.virtualMainVolume(of: device) else { return }
+        guard outputVolumeSnapshot == nil,
+              let deviceUID = Self.deviceUID(for: device),
+              let outputVolume = Self.virtualMainVolume(of: device) else { return }
 
         outputVolumeSnapshot = OutputVolumeSnapshot(
-            device: device,
+            deviceUID: deviceUID,
             volume: outputVolume,
             isMuted: Self.muteState(of: device)
         )
+        persistOutputVolumeSnapshot(outputVolumeSnapshot)
         try? Self.setVirtualMainVolume(of: device, to: 1)
         try? Self.setMuteState(of: device, to: 0)
     }
 
     private func restoreOutputVolume() {
         guard let snapshot = outputVolumeSnapshot else { return }
-        try? Self.setVirtualMainVolume(of: snapshot.device, to: snapshot.volume)
+        guard let device = Self.device(withUID: snapshot.deviceUID) else { return }
+        try? Self.setVirtualMainVolume(of: device, to: snapshot.volume)
         if let isMuted = snapshot.isMuted {
-            try? Self.setMuteState(of: snapshot.device, to: isMuted)
+            try? Self.setMuteState(of: device, to: isMuted)
         }
         outputVolumeSnapshot = nil
+        clearPersistedOutputVolumeSnapshot()
+    }
+
+    private func recoverPersistedOutputVolume() {
+        let defaults = UserDefaults.standard
+        guard let deviceUID = defaults.string(forKey: PreferenceKey.volumeSnapshotUID),
+              defaults.object(forKey: PreferenceKey.volumeSnapshotValue) != nil else { return }
+        let snapshot = OutputVolumeSnapshot(
+            deviceUID: deviceUID,
+            volume: defaults.float(forKey: PreferenceKey.volumeSnapshotValue),
+            isMuted: defaults.object(forKey: PreferenceKey.volumeSnapshotMute).map { _ in
+                UInt32(defaults.integer(forKey: PreferenceKey.volumeSnapshotMute))
+            }
+        )
+        outputVolumeSnapshot = snapshot
+        restoreOutputVolume()
+    }
+
+    private func persistOutputVolumeSnapshot(_ snapshot: OutputVolumeSnapshot?) {
+        guard let snapshot else { return }
+        let defaults = UserDefaults.standard
+        defaults.set(snapshot.deviceUID, forKey: PreferenceKey.volumeSnapshotUID)
+        defaults.set(snapshot.volume, forKey: PreferenceKey.volumeSnapshotValue)
+        if let isMuted = snapshot.isMuted {
+            defaults.set(Int(isMuted), forKey: PreferenceKey.volumeSnapshotMute)
+        } else {
+            defaults.removeObject(forKey: PreferenceKey.volumeSnapshotMute)
+        }
+    }
+
+    private func clearPersistedOutputVolumeSnapshot() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: PreferenceKey.volumeSnapshotUID)
+        defaults.removeObject(forKey: PreferenceKey.volumeSnapshotValue)
+        defaults.removeObject(forKey: PreferenceKey.volumeSnapshotMute)
+    }
+
+    private func optimizeOutputBuffer(for device: AudioDevice) {
+        restoreOutputBuffer()
+        guard latencyMode == .low,
+              let currentFrameSize = Self.bufferFrameSize(of: device.id),
+              currentFrameSize > 256,
+              Self.canSetBufferFrameSize(of: device.id),
+              let range = Self.bufferFrameSizeRange(of: device.id) else { return }
+
+        let targetFrameSize = UInt32(min(max(256, range.mMinimum), range.mMaximum))
+        guard targetFrameSize < currentFrameSize else { return }
+        outputBufferSnapshot = OutputBufferSnapshot(deviceUID: device.uid, frameSize: currentFrameSize)
+        do {
+            try Self.setBufferFrameSize(of: device.id, to: targetFrameSize)
+        } catch {
+            outputBufferSnapshot = nil
+        }
+    }
+
+    private func restoreOutputBuffer() {
+        guard let snapshot = outputBufferSnapshot else { return }
+        if let device = Self.device(withUID: snapshot.deviceUID) {
+            try? Self.setBufferFrameSize(of: device, to: snapshot.frameSize)
+        }
+        outputBufferSnapshot = nil
     }
 
     private func installDefaultDeviceListeners(expectedDevice: AudioDeviceID) {
@@ -362,6 +761,8 @@ final class AudioRouter {
 
         if defaultOutput != expectedDevice {
             let userSelectedDevice = defaultOutput
+            routingRequested = false
+            recoveryTask?.cancel()
             stop(restoreSystemDevices: false, preserveSavedDevices: false)
             if let userSelectedDevice {
                 try? Self.setDefaultDevice(
@@ -381,50 +782,47 @@ final class AudioRouter {
     }
 
 
-    private func installSystemVolumeListener(for control: AudioObjectID) {
+    private func installSystemVolumeListener(for endpoint: VolumeEndpoint) {
         removeSystemVolumeListener()
 
-        volumeControl = control
-        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+        volumeEndpoint = endpoint
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.syncVolumeFromSystemControl(control)
+                self?.syncVolumeFromSystemControl(endpoint)
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         volumeSyncTimer = timer
 
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioLevelControlPropertyScalarValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
+        var address = endpoint.address
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.syncVolumeFromSystemControl(control)
+            self?.syncVolumeFromSystemControl(endpoint)
         }
-        let status = AudioObjectAddPropertyListenerBlock(control, &address, .main, listener)
+        let status = AudioObjectAddPropertyListenerBlock(endpoint.objectID, &address, .main, listener)
         if status == noErr {
             systemVolumeListener = listener
         }
-        syncVolumeFromSystemControl(control)
+        syncVolumeFromSystemControl(endpoint)
     }
 
     private func removeSystemVolumeListener() {
         volumeSyncTimer?.invalidate()
         volumeSyncTimer = nil
-        if let volumeControl, let systemVolumeListener {
-            var address = AudioObjectPropertyAddress(
-                mSelector: kAudioLevelControlPropertyScalarValue,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
+        if let volumeEndpoint, let systemVolumeListener {
+            var address = volumeEndpoint.address
+            AudioObjectRemovePropertyListenerBlock(
+                volumeEndpoint.objectID,
+                &address,
+                .main,
+                systemVolumeListener
             )
-            AudioObjectRemovePropertyListenerBlock(volumeControl, &address, .main, systemVolumeListener)
         }
-        self.volumeControl = nil
+        self.volumeEndpoint = nil
         self.systemVolumeListener = nil
     }
 
-    private func syncVolumeFromSystemControl(_ control: AudioObjectID) {
-        guard let systemVolume = Self.volume(of: control) else { return }
+    private func syncVolumeFromSystemControl(_ endpoint: VolumeEndpoint) {
+        guard let systemVolume = Self.volume(of: endpoint) else { return }
         if abs(volume - systemVolume) > 0.0001 {
             volume = systemVolume
         }
@@ -458,7 +856,18 @@ final class AudioRouter {
         ) == noErr else { return [] }
 
         return identifiers.compactMap { identifier in
-            deviceName(for: identifier).map { AudioDevice(id: identifier, name: $0) }
+            guard let name = deviceName(for: identifier) else { return nil }
+            let uid = deviceUID(for: identifier) ?? "coreaudio:\(identifier)"
+            return AudioDevice(id: identifier, uid: uid, name: name)
+        }
+    }
+
+    private static var outputDeviceList: [AudioDevice] {
+        devices.filter {
+            $0.name != virtualDeviceName
+                && $0.name != legacyVirtualDeviceName
+                && hasChannels($0.id, scope: kAudioObjectPropertyScopeOutput)
+                && !isMicrophone($0.name)
         }
     }
 
@@ -474,6 +883,83 @@ final class AudioRouter {
             return nil
         }
         return name?.takeUnretainedValue() as String?
+    }
+
+    private static func deviceUID(for device: AudioDeviceID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var uid: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, &uid) == noErr else {
+            return nil
+        }
+        return uid?.takeUnretainedValue() as String?
+    }
+
+    private static func device(withUID uid: String) -> AudioDeviceID? {
+        devices.first { $0.uid == uid }?.id
+    }
+
+    private static func bufferFrameSize(of device: AudioDeviceID) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var frameSize: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, &frameSize) == noErr else {
+            return nil
+        }
+        return frameSize
+    }
+
+    private static func bufferFrameSizeRange(of device: AudioDeviceID) -> AudioValueRange? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSizeRange,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var range = AudioValueRange()
+        var dataSize = UInt32(MemoryLayout<AudioValueRange>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &dataSize, &range) == noErr else {
+            return nil
+        }
+        return range
+    }
+
+    private static func canSetBufferFrameSize(of device: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var isSettable = DarwinBoolean(false)
+        return AudioObjectIsPropertySettable(device, &address, &isSettable) == noErr
+            && isSettable.boolValue
+    }
+
+    private static func setBufferFrameSize(of device: AudioDeviceID, to frameSize: UInt32) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var mutableFrameSize = frameSize
+        let status = AudioObjectSetPropertyData(
+            device,
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<UInt32>.size),
+            &mutableFrameSize
+        )
+        guard status == noErr else {
+            throw AudioRouterError.coreAudio(status, "Optimising the output buffer")
+        }
     }
 
     private static func hasChannels(_ device: AudioDeviceID, scope: AudioObjectPropertyScope) -> Bool {
@@ -526,10 +1012,6 @@ final class AudioRouter {
             &device
         ) == noErr else { return nil }
         return device
-    }
-
-    private static func defaultDeviceName(for selector: AudioObjectPropertySelector) -> String? {
-        defaultDevice(for: selector).flatMap(deviceName(for:))
     }
 
     private static func firstDeviceName(containing needle: String, requiringInput: Bool) -> String? {
@@ -670,22 +1152,30 @@ final class AudioRouter {
         }
     }
 
-    private static func nativeOutputVolumeControl(for device: AudioDeviceID) -> AudioObjectID? {
-        guard virtualMainVolume(of: device) != nil,
-              let control = outputVolumeControl(for: device) else {
-            return nil
-        }
+    private static func hasNativeOutputVolume(for device: AudioDeviceID) -> Bool {
+        guard virtualMainVolume(of: device) != nil else { return false }
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioLevelControlPropertyScalarValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioObjectPropertyScopeOutput,
             mElement: kAudioObjectPropertyElementMain
         )
         var isSettable = DarwinBoolean(false)
-        guard AudioObjectIsPropertySettable(control, &address, &isSettable) == noErr,
-              isSettable.boolValue else {
-            return nil
+        return AudioObjectIsPropertySettable(device, &address, &isSettable) == noErr
+            && isSettable.boolValue
+    }
+
+    private static func volume(of endpoint: VolumeEndpoint) -> Float? {
+        switch endpoint {
+        case let .control(control): return volume(of: control)
+        case let .virtualMain(device): return virtualMainVolume(of: device)
         }
-        return control
+    }
+
+    private static func setVolume(of endpoint: VolumeEndpoint, to volume: Float) throws {
+        switch endpoint {
+        case let .control(control): try setVolume(of: control, to: volume)
+        case let .virtualMain(device): try setVirtualMainVolume(of: device, to: volume)
+        }
     }
 
     private static func volume(of control: AudioObjectID) -> Float? {

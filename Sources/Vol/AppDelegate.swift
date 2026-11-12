@@ -18,6 +18,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateStatusTitle()
             self?.viewModel.refresh()
         }
+        router.onError = { [weak self] message in
+            self?.showError(message)
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
         updateStatusTitle()
         showControlWindow()
         if router.requiresMicrophonePermission {
@@ -28,7 +43,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        router.stop(restoreSystemDevices: true)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        router.shutdown()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -68,8 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for device in router.outputDevices {
             let item = NSMenuItem(title: device.name, action: #selector(selectOutput(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = device.name
-            item.state = device.name == router.selectedOutputName ? .on : .off
+            item.representedObject = device.uid
+            item.state = device.uid == router.selectedOutputUID ? .on : .off
             outputMenu.addItem(item)
         }
         let outputItem = NSMenuItem(title: "Output", action: nil, keyEquivalent: "")
@@ -101,8 +117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func selectOutput(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        router.selectOutput(named: name)
+        guard let uid = sender.representedObject as? String else { return }
+        router.selectOutput(uid: uid)
         viewModel.refresh()
     }
 
@@ -171,6 +187,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func systemWillSleep() {
+        router.suspendForSleep()
+    }
+
+    @objc private func systemDidWake() {
+        router.resumeAfterWake()
+    }
+
     private func enableLaunchAtLogin() {
         guard SMAppService.mainApp.status != .enabled else { return }
         do {
@@ -189,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let hostingView = NSHostingView(rootView: ControlPanel(model: viewModel))
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 445),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 490),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false

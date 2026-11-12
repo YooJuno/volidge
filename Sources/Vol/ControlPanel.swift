@@ -8,12 +8,15 @@ final class RouterViewModel: ObservableObject {
     private let router: AudioRouter
 
     @Published private(set) var outputDevices: [AudioDevice] = []
+    @Published private(set) var selectedOutputUID = ""
     @Published private(set) var selectedOutputName = ""
+    @Published private(set) var selectedOutputUsesBridge = true
     @Published private(set) var isRunning = false
     @Published private(set) var isDirectOutput = false
     @Published private(set) var status = ""
     @Published private(set) var launchAtLogin = false
     @Published var volume: Double = 0
+    @Published var latencyMode: AudioLatencyMode = .low
     @Published var errorMessage: String?
 
     init(router: AudioRouter) {
@@ -23,16 +26,24 @@ final class RouterViewModel: ObservableObject {
 
     func refresh() {
         outputDevices = router.outputDevices
+        selectedOutputUID = router.selectedOutputUID
         selectedOutputName = router.selectedOutputName
+        selectedOutputUsesBridge = router.selectedOutputUsesBridge
         isRunning = router.isRunning
         isDirectOutput = router.isDirectOutput
         volume = Double(router.volume)
         status = router.statusDescription
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        latencyMode = router.latencyMode
     }
 
-    func selectOutput(_ name: String) {
-        router.selectOutput(named: name)
+    func selectOutput(_ uid: String) {
+        router.selectOutput(uid: uid)
+        refresh()
+    }
+
+    func setLatencyMode(_ mode: AudioLatencyMode) {
+        router.setLatencyMode(mode)
         refresh()
     }
 
@@ -92,11 +103,20 @@ struct ControlPanel: View {
             }
 
             Picker("Output", selection: outputBinding) {
-                ForEach(model.outputDevices, id: \.name) { device in
-                    Text(device.name).tag(device.name)
+                ForEach(model.outputDevices) { device in
+                    Text(device.name).tag(device.uid)
                 }
             }
             .pickerStyle(.menu)
+
+            if model.selectedOutputUsesBridge {
+                Picker("Latency", selection: latencyBinding) {
+                    ForEach(AudioLatencyMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
 
             HStack(spacing: 7) {
                 Circle()
@@ -177,8 +197,15 @@ struct ControlPanel: View {
 
     private var outputBinding: Binding<String> {
         Binding(
-            get: { model.selectedOutputName },
-            set: { name in model.selectOutput(name) }
+            get: { model.selectedOutputUID },
+            set: { uid in model.selectOutput(uid) }
+        )
+    }
+
+    private var latencyBinding: Binding<AudioLatencyMode> {
+        Binding(
+            get: { model.latencyMode },
+            set: { mode in model.setLatencyMode(mode) }
         )
     }
 
