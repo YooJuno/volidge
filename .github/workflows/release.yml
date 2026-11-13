@@ -54,8 +54,8 @@ jobs:
         run: |
           codesign --verify --deep --strict .build/export/Volidge.app
           codesign --verify --deep --strict .build/export/Volidge.driver
-          lipo -verify_arch "$TARGET_ARCH" .build/export/Volidge.app/Contents/MacOS/Vol
-          lipo -verify_arch "$TARGET_ARCH" .build/export/Volidge.driver/Contents/MacOS/Volidge
+          lipo .build/export/Volidge.app/Contents/MacOS/Vol -verify_arch "$TARGET_ARCH"
+          lipo .build/export/Volidge.driver/Contents/MacOS/Volidge -verify_arch "$TARGET_ARCH"
           version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' App/Info.plist)
           pkgutil --payload-files "release/Volidge-$version.pkg" > payload.txt
           grep -q 'Applications/Volidge.app/Contents/MacOS/Vol' payload.txt
