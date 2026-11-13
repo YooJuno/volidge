@@ -7,15 +7,16 @@ import SwiftUI
 final class RouterViewModel: ObservableObject {
     private let router: AudioRouter
 
-    @Published private(set) var inputDevices: [AudioDevice] = []
     @Published private(set) var outputDevices: [AudioDevice] = []
-    @Published private(set) var selectedInputName = ""
+    @Published private(set) var selectedOutputUID = ""
     @Published private(set) var selectedOutputName = ""
+    @Published private(set) var selectedOutputUsesBridge = true
     @Published private(set) var isRunning = false
-    @Published private(set) var isMuted = false
+    @Published private(set) var isDirectOutput = false
     @Published private(set) var status = ""
     @Published private(set) var launchAtLogin = false
     @Published var volume: Double = 0
+    @Published var latencyMode: AudioLatencyMode = .low
     @Published var errorMessage: String?
 
     init(router: AudioRouter) {
@@ -24,24 +25,25 @@ final class RouterViewModel: ObservableObject {
     }
 
     func refresh() {
-        inputDevices = router.inputDevices
         outputDevices = router.outputDevices
-        selectedInputName = router.selectedInputName
+        selectedOutputUID = router.selectedOutputUID
         selectedOutputName = router.selectedOutputName
+        selectedOutputUsesBridge = router.selectedOutputUsesBridge
         isRunning = router.isRunning
-        isMuted = router.isMuted
+        isDirectOutput = router.isDirectOutput
         volume = Double(router.volume)
         status = router.statusDescription
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        latencyMode = router.latencyMode
     }
 
-    func selectInput(_ name: String) {
-        router.selectInput(named: name)
+    func selectOutput(_ uid: String) {
+        router.selectOutput(uid: uid)
         refresh()
     }
 
-    func selectOutput(_ name: String) {
-        router.selectOutput(named: name)
+    func setLatencyMode(_ mode: AudioLatencyMode) {
+        router.setLatencyMode(mode)
         refresh()
     }
 
@@ -63,11 +65,6 @@ final class RouterViewModel: ObservableObject {
         refresh()
     }
 
-    func toggleMute() {
-        router.toggleMute()
-        refresh()
-    }
-
     func setLaunchAtLogin(_ enabled: Bool) {
         do {
             if enabled {
@@ -81,25 +78,22 @@ final class RouterViewModel: ObservableObject {
         refresh()
     }
 
-    func openSoundSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")!)
-    }
 }
 
 struct ControlPanel: View {
     @ObservedObject var model: RouterViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 12) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
                     .frame(width: 52, height: 52)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Vol")
+                    Text("Volidge")
                         .font(.system(size: 28, weight: .bold))
-                    Text("iD14 keyboard volume bridge")
+                    Text("Keyboard volume for your audio interface")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -108,25 +102,46 @@ struct ControlPanel: View {
                     .frame(width: 10, height: 10)
             }
 
-            VStack(spacing: 12) {
-                Picker("Virtual audio device", selection: inputBinding) {
-                    ForEach(model.inputDevices, id: \.name) { device in
-                        Text(device.name).tag(device.name)
-                    }
-                }
-                Picker("Play through", selection: outputBinding) {
-                    ForEach(model.outputDevices, id: \.name) { device in
-                        Text(device.name).tag(device.name)
-                    }
+            Picker("Output", selection: outputBinding) {
+                ForEach(model.outputDevices) { device in
+                    Text(device.name).tag(device.uid)
                 }
             }
             .pickerStyle(.menu)
+
+            if model.selectedOutputUsesBridge {
+                Picker("Latency", selection: latencyBinding) {
+                    ForEach(AudioLatencyMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(model.isRunning ? Color.green : Color.secondary)
+                    .frame(width: 7, height: 7)
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if model.isRunning && !model.isDirectOutput {
+                Label(
+                    "The orange microphone indicator is macOS showing access to Volidge's virtual audio channel. Your Mac's microphone is not recorded.",
+                    systemImage: "waveform"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Volume")
                     Spacer()
-                    Text("\(Int((model.isMuted ? 0 : model.volume) * 100))%")
+                    Text("\(Int(model.volume * 100))%")
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
@@ -137,28 +152,18 @@ struct ControlPanel: View {
                     .foregroundStyle(.secondary)
             }
 
-            Text(model.status)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-
             if let errorMessage = model.errorMessage {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(.red)
             }
 
-            HStack(spacing: 10) {
-                Button(model.isRunning ? "Stop Routing" : "Start Routing") {
+            HStack(spacing: 12) {
+                Button(model.isRunning ? "Stop" : "Start") {
                     model.toggleRouting()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
-
-                Button(model.isMuted ? "Unmute" : "Mute") {
-                    model.toggleMute()
-                }
-                .disabled(!model.isRunning)
 
                 Spacer()
 
@@ -167,33 +172,48 @@ struct ControlPanel: View {
                     .controlSize(.small)
             }
 
-            HStack {
-                Button("Sound Settings…") {
-                    model.openSoundSettings()
+            Divider()
+
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Coffee donation")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("3333063670931 · 카카오뱅크 유준호")
+                        .font(.caption)
+                        .textSelection(.enabled)
                 }
-                .buttonStyle(.link)
                 Spacer()
-                Text("BlackHole → iD14")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                Button("Copy account") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString("3333063670931", forType: .string)
+                }
+                .controlSize(.small)
             }
         }
         .padding(28)
-        .frame(width: 520)
-    }
-
-    private var inputBinding: Binding<String> {
-        Binding(
-            get: { model.selectedInputName },
-            set: { name in model.selectInput(name) }
-        )
+        .frame(width: 480)
     }
 
     private var outputBinding: Binding<String> {
         Binding(
-            get: { model.selectedOutputName },
-            set: { name in model.selectOutput(name) }
+            get: { model.selectedOutputUID },
+            set: { uid in model.selectOutput(uid) }
         )
+    }
+
+    private var latencyBinding: Binding<AudioLatencyMode> {
+        Binding(
+            get: { model.latencyMode },
+            set: { mode in model.setLatencyMode(mode) }
+        )
+    }
+
+    private var statusText: String {
+        if model.isDirectOutput {
+            return "Using \(model.selectedOutputName) directly with no added latency"
+        }
+        return model.isRunning ? "Routing system audio to \(model.selectedOutputName)" : "Routing is paused"
     }
 
     private var volumeBinding: Binding<Double> {

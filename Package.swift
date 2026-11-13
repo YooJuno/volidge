@@ -8,8 +8,14 @@ let package = Package(
         .executable(name: "Vol", targets: ["Vol"])
     ],
     targets: [
+        .target(
+            name: "VolAtomics",
+            path: "Sources/VolAtomics",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "Vol",
+            dependencies: ["VolAtomics"],
             path: "Sources/Vol",
             linkerSettings: [
                 .linkedFramework("AppKit"),

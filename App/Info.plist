@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleDisplayName</key>
-    <string>Vol</string>
+    <string>Volidge</string>
     <key>CFBundleExecutable</key>
     <string>Vol</string>
     <key>CFBundleIdentifier</key>
@@ -11,18 +11,20 @@
     <key>CFBundleIconFile</key>
     <string>VolIcon</string>
     <key>CFBundleName</key>
-    <string>Vol</string>
+    <string>Volidge</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+	<string>1.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+	<string>120</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
-    <key>LSUIElement</key>
-    <true/>
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Vol receives system audio from the selected virtual audio device and routes it to your chosen output device.</string>
+	<string>Volidge reads only its virtual system-audio channel and never records your Mac's physical microphone.</string>
 </dict>
 </plist>
