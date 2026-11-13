@@ -7,7 +7,6 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let router = AudioRouter()
     private lazy var viewModel = RouterViewModel(router: router)
-    private var mediaKeyMonitor: MediaKeyMonitor?
     private var controlWindow: NSWindow?
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -15,32 +14,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureStatusItem()
         enableLaunchAtLogin()
 
-        mediaKeyMonitor = MediaKeyMonitor { [weak self] key in
-            guard let self else { return }
-
-            switch key {
-            case .volumeUp:
-                self.router.adjustVolume(by: 0.05)
-            case .volumeDown:
-                self.router.adjustVolume(by: -0.05)
-            case .mute:
-                break
-            }
-        }
-        mediaKeyMonitor?.start()
-
         router.onStateChange = { [weak self] in
             self?.updateStatusTitle()
             self?.viewModel.refresh()
         }
+        router.onError = { [weak self] message in
+            self?.showError(message)
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
         updateStatusTitle()
         showControlWindow()
-        requestAudioPermission()
+        if router.requiresMicrophonePermission {
+            requestAudioPermission()
+        } else {
+            startRoutingIfPossible()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        router.stop(restoreSystemDevices: true)
-        mediaKeyMonitor?.stop()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        router.shutdown()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -80,8 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for device in router.outputDevices {
             let item = NSMenuItem(title: device.name, action: #selector(selectOutput(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = device.name
-            item.state = device.name == router.selectedOutputName ? .on : .off
+            item.representedObject = device.uid
+            item.state = device.uid == router.selectedOutputUID ? .on : .off
             outputMenu.addItem(item)
         }
         let outputItem = NSMenuItem(title: "Output", action: nil, keyEquivalent: "")
@@ -113,8 +117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func selectOutput(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        router.selectOutput(named: name)
+        guard let uid = sender.representedObject as? String else { return }
+        router.selectOutput(uid: uid)
         viewModel.refresh()
     }
 
@@ -183,6 +187,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func systemWillSleep() {
+        router.suspendForSleep()
+    }
+
+    @objc private func systemDidWake() {
+        router.resumeAfterWake()
+    }
+
     private func enableLaunchAtLogin() {
         guard SMAppService.mainApp.status != .enabled else { return }
         do {
@@ -201,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let hostingView = NSHostingView(rootView: ControlPanel(model: viewModel))
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 405),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 490),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
