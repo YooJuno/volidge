@@ -45,6 +45,15 @@ and 192 kHz. Volidge matches the device sample rate to the selected interface.
 
 ## Development
 
+GitHub Actions builds separate Apple Silicon (`arm64`) and Intel (`x86_64`)
+installers on `main` pushes, pull requests and manual runs. Each job verifies
+plist versions, scripts, ad-hoc signatures, architecture slices and installer
+contents without installing the driver or changing the runner's audio devices.
+Download the `.pkg` and SHA-256 files from the workflow artifacts. Pushing a
+`vX.Y.Z` tag matching the application, driver and installer version publishes
+both successful builds to GitHub Releases. Builds do not include Developer ID
+signing or notarization. Windows and Linux are not supported by this Core Audio app.
+
 ```sh
 scripts/build_app.sh
 open .build/export/Volidge.app

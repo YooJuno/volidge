@@ -1,0 +1,94 @@
+name: Build and release macOS packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: volidge-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate package metadata and scripts
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: |
+          zsh -n scripts/build_app.sh scripts/build_driver.sh scripts/build_pkg.sh
+          bash -n Package/Scripts/preinstall Package/Scripts/postinstall
+          plutil -lint App/Info.plist Drivers/VolDevice/Info.plist Package/Component.plist
+          python3 - <<'PY'
+          import os, pathlib, plistlib, re
+          app = plistlib.loads(pathlib.Path('App/Info.plist').read_bytes())
+          driver = plistlib.loads(pathlib.Path('Drivers/VolDevice/Info.plist').read_bytes())
+          version = app['CFBundleShortVersionString']
+          assert driver['CFBundleShortVersionString'] == version
+          assert re.search(r'^version="' + re.escape(version) + r'"$', pathlib.Path('scripts/build_pkg.sh').read_text(), re.M)
+          if os.environ['RELEASE_TAG']:
+              assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag must match package version'
+          PY
+      - name: Build application, driver and installer
+        run: zsh scripts/build_pkg.sh
+      - name: Verify signatures, architectures and installer payload
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          codesign --verify --deep --strict .build/export/Volidge.app
+          codesign --verify --deep --strict .build/export/Volidge.driver
+          lipo -verify_arch "$TARGET_ARCH" .build/export/Volidge.app/Contents/MacOS/Vol
+          lipo -verify_arch "$TARGET_ARCH" .build/export/Volidge.driver/Contents/MacOS/Volidge
+          version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' App/Info.plist)
+          pkgutil --payload-files "release/Volidge-$version.pkg" > payload.txt
+          grep -q 'Applications/Volidge.app/Contents/MacOS/Vol' payload.txt
+          grep -q 'Library/Audio/Plug-Ins/HAL/Volidge.driver/Contents/MacOS/Volidge' payload.txt
+          mkdir -p artifacts
+          cp "release/Volidge-$version.pkg" "artifacts/Volidge-$version-macos-$TARGET_ARCH.pkg"
+          cd artifacts
+          shasum -a 256 *.pkg > "SHA256SUMS-macos-$TARGET_ARCH.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Volidge-macos-${{ matrix.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Volidge-macos-*
+          path: release
+          merge-multiple: true
+      - name: Publish verified installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd release
+          sha256sum --check --strict SHA256SUMS-macos-*.txt
+          gh release create "$RELEASE_TAG" ./*.pkg SHA256SUMS-macos-*.txt --verify-tag --generate-notes --title "Volidge $RELEASE_TAG" --notes 'macOS 14 이상, Apple Silicon·Intel용 별도 설치 파일입니다. 앱·드라이버는 ad-hoc 서명이며 설치 패키지는 Developer ID 서명·공증을 포함하지 않습니다. CI에서는 설치나 오디오 장치 연결을 수행하지 않습니다.'
