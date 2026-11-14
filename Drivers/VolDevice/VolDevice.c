@@ -146,7 +146,6 @@ static Boolean								gBox_Acquired					= true;
 static pthread_mutex_t						gDevice_IOMutex					= PTHREAD_MUTEX_INITIALIZER;
 static Float64								gDevice_SampleRate				= 44100.0;
 static UInt64								gDevice_IOIsRunning				= 0;
-static const UInt32							kDevice_RingBufferSize			= 512;
 static const UInt32							kDevice_LoopbackBufferFrames	= 8192;
 static const UInt32							kDevice_LoopbackFrameMask		= 8191;
 static _Atomic UInt32						gDevice_LoopbackBuffer[8192 * 2];
@@ -229,6 +228,19 @@ static void NullAudio_AdvanceLoopbackReadFrame(UInt64 inMinimumReadFrame)
 			memory_order_relaxed))
 	{
 	}
+}
+
+static UInt32 NullAudio_GetZeroTimeStampPeriodForSampleRate(Float64 inSampleRate)
+{
+	if(inSampleRate <= 48000.0)
+	{
+		return 128;
+	}
+	if(inSampleRate <= 96000.0)
+	{
+		return 256;
+	}
+	return 512;
 }
 
 //==================================================================================================
@@ -2519,7 +2531,7 @@ static OSStatus	NullAudio_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
 			//	This property returns how many frames the HAL should expect to see between
 			//	successive sample times in the zero time stamps this device provides.
 			FailWithAction(inDataSize < sizeof(UInt32), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetDevicePropertyData: not enough space for the return value of kAudioDevicePropertyZeroTimeStampPeriod for the device");
-			*((UInt32*)outData) = kDevice_RingBufferSize;
+			*((UInt32*)outData) = NullAudio_GetZeroTimeStampPeriodForSampleRate(gDevice_SampleRate);
 			*outDataSize = sizeof(UInt32);
 			break;
 
@@ -4064,8 +4076,7 @@ static OSStatus	NullAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, 
 	//	kAudioDevicePropertyZeroTimeStampPeriod apart. This is often modeled using a ring buffer
 	//	where the zero time stamp is updated when wrapping around the ring buffer.
 	//
-	//	For this device, the zero time stamps' sample time increments every kDevice_RingBufferSize
-	//	frames and the host time increments by kDevice_RingBufferSize * gDevice_HostTicksPerFrame.
+	//	Keep the zero timestamp cadence near 2.7 ms at every supported sample rate.
 	
 	#pragma unused(inClientID)
 	
@@ -4075,6 +4086,7 @@ static OSStatus	NullAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, 
 	Float64 theHostTicksPerRingBuffer;
 	Float64 theHostTickOffset;
 	UInt64 theNextHostTime;
+	UInt32 theZeroTimeStampPeriod;
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "NullAudio_GetZeroTimeStamp: bad driver reference");
@@ -4087,7 +4099,8 @@ static OSStatus	NullAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, 
 	theCurrentHostTime = mach_absolute_time();
 	
 	//	calculate the next host time
-	theHostTicksPerRingBuffer = gDevice_HostTicksPerFrame * ((Float64)kDevice_RingBufferSize);
+	theZeroTimeStampPeriod = NullAudio_GetZeroTimeStampPeriodForSampleRate(gDevice_SampleRate);
+	theHostTicksPerRingBuffer = gDevice_HostTicksPerFrame * ((Float64)theZeroTimeStampPeriod);
 	theHostTickOffset = ((Float64)(gDevice_NumberTimeStamps + 1)) * theHostTicksPerRingBuffer;
 	theNextHostTime = gDevice_AnchorHostTime + ((UInt64)theHostTickOffset);
 	
@@ -4098,7 +4111,7 @@ static OSStatus	NullAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, 
 	}
 	
 	//	set the return values
-	*outSampleTime = (Float64)gDevice_NumberTimeStamps * (Float64)kDevice_RingBufferSize;
+	*outSampleTime = (Float64)gDevice_NumberTimeStamps * (Float64)theZeroTimeStampPeriod;
 	*outHostTime = gDevice_AnchorHostTime + (UInt64)(((Float64)gDevice_NumberTimeStamps) * theHostTicksPerRingBuffer);
 	*outSeed = 1;
 	

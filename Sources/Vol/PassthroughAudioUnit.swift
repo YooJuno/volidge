@@ -58,7 +58,12 @@ final class PassthroughAudioUnit: @unchecked Sendable {
         inputBufferList.deallocate()
     }
 
-    func start(inputDevice: AudioDeviceID, outputDevice: AudioDeviceID, sampleRate: Float64) throws {
+    func start(
+        inputDevice: AudioDeviceID,
+        outputDevice: AudioDeviceID,
+        sampleRate: Float64,
+        maximumOutputFramesPerSlice: UInt32 = UInt32(maximumFramesPerSlice)
+    ) throws {
         stop()
         VolAtomicUInt64StoreRelaxed(renderCount, 0)
         VolAtomicUInt64StoreRelaxed(captureCount, 0)
@@ -72,7 +77,12 @@ final class PassthroughAudioUnit: @unchecked Sendable {
 
         do {
             try configureInput(inputUnit, device: inputDevice, format: format)
-            try configureOutput(outputUnit, device: outputDevice, format: format)
+            try configureOutput(
+                outputUnit,
+                device: outputDevice,
+                format: format,
+                maximumFramesPerSlice: maximumOutputFramesPerSlice
+            )
 
             var inputCallback = AURenderCallbackStruct(
                 inputProc: Self.inputCallback,
@@ -187,13 +197,14 @@ final class PassthroughAudioUnit: @unchecked Sendable {
     private func configureOutput(
         _ audioUnit: AudioUnit,
         device: AudioDeviceID,
-        format: AudioStreamBasicDescription
+        format: AudioStreamBasicDescription,
+        maximumFramesPerSlice: UInt32
     ) throws {
         var enabled: UInt32 = 1
         var disabled: UInt32 = 0
         var device = device
         var format = format
-        var maximumFramesPerSlice = UInt32(Self.maximumFramesPerSlice)
+        var maximumFramesPerSlice = max(maximumFramesPerSlice, 64)
 
         try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &enabled, UInt32(MemoryLayout<UInt32>.size)), "Enabling iD14 output")
         try check(AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &disabled, UInt32(MemoryLayout<UInt32>.size)), "Disabling unused iD14 input")
@@ -295,8 +306,17 @@ private struct AudioRingBufferMetrics {
 }
 
 private final class AudioRingBuffer: @unchecked Sendable {
+    private static let interpolationRadius = 24
+    private static let interpolationTapCount = interpolationRadius * 2
+    private static let interpolationPhaseCount = 2_048
+    private static let interpolationLookahead = interpolationRadius
+    private static let minimumSafetyFrames = 32
+    private static let maximumRateCorrection = 0.002
+
     private let frameCapacity: Int
+    private let frameMask: Int
     private let storage: UnsafeMutablePointer<Float>
+    private let interpolationTable: UnsafeMutablePointer<Float>
     private let readFrame = VolAtomicUInt64Create(0)!
     private let writeFrame = VolAtomicUInt64Create(0)!
     private let droppedFrames = VolAtomicUInt64Create(0)!
@@ -307,14 +327,24 @@ private final class AudioRingBuffer: @unchecked Sendable {
     private let rateCorrectionPPM = VolAtomicUInt32Create(0)!
     private var readPosition = 0.0
     private var currentRateRatio = 1.0
+    private var rateCorrectionIntegral = 0.0
+    private var filteredQueueError = 0.0
+    private var queueFilterIsPrimed = false
+    private var adaptiveSafetyFrames = minimumSafetyFrames
     private var lastOverflowGeneration: UInt64 = 0
     private var isPrimed = false
     private var hasPrimed = false
 
     init(frameCapacity: Int) {
+        precondition(frameCapacity > 0 && frameCapacity.nonzeroBitCount == 1)
         self.frameCapacity = frameCapacity
+        frameMask = frameCapacity - 1
         storage = UnsafeMutablePointer<Float>.allocate(capacity: frameCapacity * 2)
         storage.initialize(repeating: 0, count: frameCapacity * 2)
+        interpolationTable = UnsafeMutablePointer<Float>.allocate(
+            capacity: Self.interpolationPhaseCount * Self.interpolationTapCount
+        )
+        buildInterpolationTable()
     }
 
     deinit {
@@ -326,6 +356,7 @@ private final class AudioRingBuffer: @unchecked Sendable {
         VolAtomicUInt64Destroy(overflowGeneration)
         VolAtomicUInt64Destroy(producerFrameSize)
         VolAtomicUInt32Destroy(rateCorrectionPPM)
+        interpolationTable.deallocate()
         storage.deallocate()
     }
 
@@ -349,6 +380,10 @@ private final class AudioRingBuffer: @unchecked Sendable {
         VolAtomicUInt32StoreRelaxed(rateCorrectionPPM, 0)
         readPosition = 0
         currentRateRatio = 1
+        rateCorrectionIntegral = 0
+        filteredQueueError = 0
+        queueFilterIsPrimed = false
+        adaptiveSafetyFrames = Self.minimumSafetyFrames
         lastOverflowGeneration = 0
         isPrimed = false
         hasPrimed = false
@@ -392,16 +427,17 @@ private final class AudioRingBuffer: @unchecked Sendable {
         var currentReadFrame = UInt64(readPosition.rounded(.down))
         var bufferedFrames = min(currentWriteFrame &- currentReadFrame, UInt64(frameCapacity))
         let producerFrames = Int(VolAtomicUInt64LoadRelaxed(producerFrameSize))
+        adaptiveSafetyFrames = max(adaptiveSafetyFrames, Self.minimumSafetyFrames)
         let targetFrames = UInt64(
             min(
                 frameCapacity / 2,
-                max(frames + producerFrames + max(producerFrames / 2, 64), 256)
+                max(frames + producerFrames + adaptiveSafetyFrames, 128)
             )
         )
         var shouldFadeIn = false
 
         if !isPrimed {
-            guard bufferedFrames >= targetFrames + 2 else {
+            guard bufferedFrames >= targetFrames + UInt64(Self.interpolationLookahead) else {
                 if hasPrimed {
                     VolAtomicUInt64FetchAddRelaxed(underflowFrames, UInt64(frames))
                 }
@@ -430,28 +466,71 @@ private final class AudioRingBuffer: @unchecked Sendable {
         }
 
         let queueError = Double(bufferedFrames) - Double(targetFrames)
-        let normalizedError = queueError / Double(targetFrames)
-        let desiredCorrection = min(max(normalizedError * 0.006, -0.005), 0.005)
+        if queueFilterIsPrimed {
+            filteredQueueError += (queueError - filteredQueueError) * 0.03
+        } else {
+            filteredQueueError = queueError
+            queueFilterIsPrimed = true
+        }
+        let correctionDeadband = Double(max(producerFrames / 8, 12))
+        let controlledQueueError: Double
+        if abs(filteredQueueError) <= correctionDeadband {
+            controlledQueueError = 0
+        } else {
+            controlledQueueError = filteredQueueError - copysign(correctionDeadband, filteredQueueError)
+        }
+        let normalizedError = controlledQueueError / Double(targetFrames)
+        rateCorrectionIntegral = min(
+            max(
+                rateCorrectionIntegral + normalizedError * 0.000_003,
+                -Self.maximumRateCorrection
+            ),
+            Self.maximumRateCorrection
+        )
+        let desiredCorrection = min(
+            max(
+                normalizedError * 0.002 + rateCorrectionIntegral,
+                -Self.maximumRateCorrection
+            ),
+            Self.maximumRateCorrection
+        )
         let desiredRateRatio = 1 + desiredCorrection
-        currentRateRatio += (desiredRateRatio - currentRateRatio) * 0.08
+        currentRateRatio += (desiredRateRatio - currentRateRatio) * 0.04
+        if desiredCorrection == 0,
+           abs(rateCorrectionIntegral) < 0.000_000_5,
+           abs(currentRateRatio - 1) < 0.000_000_5 {
+            currentRateRatio = 1
+            rateCorrectionIntegral = 0
+        }
         let correctionPPM = Int32((currentRateRatio - 1) * 1_000_000)
         VolAtomicUInt32StoreRelaxed(rateCorrectionPPM, UInt32(bitPattern: correctionPPM))
 
         let availableSourceFrames = Double(currentWriteFrame) - readPosition
         let readableOutputFrames = min(
             frames,
-            max(0, Int(((availableSourceFrames - 1) / currentRateRatio).rounded(.down)))
+            max(
+                0,
+                Int(
+                    ((availableSourceFrames - Double(Self.interpolationLookahead)) / currentRateRatio)
+                        .rounded(.down)
+                )
+            )
         )
 
         var sourcePosition = readPosition
         for outputFrame in 0 ..< readableOutputFrames {
             let sourceFrame = UInt64(sourcePosition.rounded(.down))
-            let fraction = Float(sourcePosition - Double(sourceFrame))
-            let inverseFraction = 1 - fraction
-            output[outputFrame * 2] = sample(at: sourceFrame, channel: 0) * inverseFraction
-                + sample(at: sourceFrame + 1, channel: 0) * fraction
-            output[outputFrame * 2 + 1] = sample(at: sourceFrame, channel: 1) * inverseFraction
-                + sample(at: sourceFrame + 1, channel: 1) * fraction
+            let fraction = sourcePosition - Double(sourceFrame)
+            if currentRateRatio == 1, fraction == 0 {
+                output[outputFrame * 2] = sample(at: sourceFrame, channel: 0)
+                output[outputFrame * 2 + 1] = sample(at: sourceFrame, channel: 1)
+            } else {
+                writeInterpolatedFrame(
+                    to: output.advanced(by: outputFrame * 2),
+                    at: sourceFrame,
+                    fraction: fraction
+                )
+            }
             sourcePosition += currentRateRatio
         }
 
@@ -466,6 +545,7 @@ private final class AudioRingBuffer: @unchecked Sendable {
         if readableOutputFrames < frames {
             fadeOut(output, endingAt: readableOutputFrames)
             VolAtomicUInt64FetchAddRelaxed(underflowFrames, UInt64(frames - readableOutputFrames))
+            increaseSafetyFrames(producerFrames: producerFrames, outputFrames: frames)
             isPrimed = false
         }
     }
@@ -482,7 +562,67 @@ private final class AudioRingBuffer: @unchecked Sendable {
     }
 
     private func sample(at frame: UInt64, channel: Int) -> Float {
-        storage[Int(frame % UInt64(frameCapacity)) * 2 + channel]
+        storage[(Int(frame) & frameMask) * 2 + channel]
+    }
+
+    private func writeInterpolatedFrame(
+        to output: UnsafeMutablePointer<Float>,
+        at frame: UInt64,
+        fraction: Double
+    ) {
+        let phase = min(
+            Int(fraction * Double(Self.interpolationPhaseCount)),
+            Self.interpolationPhaseCount - 1
+        )
+        let coefficients = interpolationTable.advanced(by: phase * Self.interpolationTapCount)
+        let firstFrame = Int64(frame) - Int64(Self.interpolationRadius - 1)
+        var left: Float = 0
+        var right: Float = 0
+        for tap in 0 ..< Self.interpolationTapCount {
+            let storageFrame = Int(firstFrame + Int64(tap)) & frameMask
+            let coefficient = coefficients[tap]
+            left += storage[storageFrame * 2] * coefficient
+            right += storage[storageFrame * 2 + 1] * coefficient
+        }
+        output[0] = left
+        output[1] = right
+    }
+
+    private func buildInterpolationTable() {
+        for phase in 0 ..< Self.interpolationPhaseCount {
+            let fraction = Double(phase) / Double(Self.interpolationPhaseCount)
+            let coefficients = interpolationTable.advanced(by: phase * Self.interpolationTapCount)
+            var total = 0.0
+            for tap in 0 ..< Self.interpolationTapCount {
+                let sampleOffset = Double(tap - (Self.interpolationRadius - 1))
+                let coefficient = Self.lanczos(sampleOffset - fraction)
+                coefficients[tap] = Float(coefficient)
+                total += coefficient
+            }
+            let normalization = Float(1 / total)
+            for tap in 0 ..< Self.interpolationTapCount {
+                coefficients[tap] *= normalization
+            }
+        }
+    }
+
+    private static func lanczos(_ value: Double) -> Double {
+        guard abs(value) < Double(interpolationRadius) else { return 0 }
+        return sinc(value) * sinc(value / Double(interpolationRadius))
+    }
+
+    private static func sinc(_ value: Double) -> Double {
+        guard abs(value) > 0.000_000_000_001 else { return 1 }
+        let angle = Double.pi * value
+        return sin(angle) / angle
+    }
+
+    private func increaseSafetyFrames(producerFrames: Int, outputFrames: Int) {
+        let increment = max(producerFrames / 2, outputFrames / 2, Self.minimumSafetyFrames)
+        let maximumSafetyFrames = max(producerFrames * 2, outputFrames * 2, 256)
+        adaptiveSafetyFrames = min(adaptiveSafetyFrames + increment, maximumSafetyFrames)
+        filteredQueueError = 0
+        queueFilterIsPrimed = false
     }
 
     private func flush(upTo writeFrame: UInt64) {
@@ -491,6 +631,9 @@ private final class AudioRingBuffer: @unchecked Sendable {
         VolAtomicUInt64StoreRelaxed(queuedFrames, 0)
         VolAtomicUInt32StoreRelaxed(rateCorrectionPPM, 0)
         currentRateRatio = 1
+        rateCorrectionIntegral = 0
+        filteredQueueError = 0
+        queueFilterIsPrimed = false
         isPrimed = false
     }
 

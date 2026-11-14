@@ -205,6 +205,7 @@ final class AudioRouter {
         UserDefaults.standard.set(selectedOutputName, forKey: PreferenceKey.outputName)
         UserDefaults.standard.set(latencyMode.rawValue, forKey: PreferenceKey.latencyMode)
         recoverPersistedOutputVolume()
+        recoverStaleDefaultDevices()
         installHardwareDeviceListener()
     }
 
@@ -269,7 +270,12 @@ final class AudioRouter {
 
     func start() throws {
         routingRequested = true
-        try startRoute()
+        do {
+            try startRoute()
+        } catch {
+            routingRequested = false
+            throw error
+        }
     }
 
     private func startRoute() throws {
@@ -313,7 +319,6 @@ final class AudioRouter {
         saveCurrentDefaultDevices(excluding: inputDevice.id)
 
         do {
-            optimizeOutputBuffer(for: outputDevice)
             normalizeOutputVolume(for: outputDevice.id)
             savedVirtualDeviceSampleRate = Self.nominalSampleRate(of: inputDevice.id)
             try Self.matchSampleRate(of: inputDevice.id, to: outputDevice.id)
@@ -325,7 +330,16 @@ final class AudioRouter {
             guard let sampleRate = Self.nominalSampleRate(of: outputDevice.id) else {
                 throw AudioRouterError.unavailableAudioUnit
             }
-            try bridge.start(inputDevice: inputDevice.id, outputDevice: outputDevice.id, sampleRate: sampleRate)
+            let outputBufferFrameSize = optimizeOutputBuffer(
+                for: outputDevice,
+                sampleRate: sampleRate
+            )
+            try bridge.start(
+                inputDevice: inputDevice.id,
+                outputDevice: outputDevice.id,
+                sampleRate: sampleRate,
+                maximumOutputFramesPerSlice: outputBufferFrameSize ?? 4_096
+            )
             installSystemVolumeListener(for: .control(volumeControl))
             isRunning = true
             activeInputDeviceID = inputDevice.id
@@ -483,7 +497,6 @@ final class AudioRouter {
         let selectors: [AudioObjectPropertySelector] = [
             kAudioDevicePropertyDeviceIsAlive,
             kAudioDevicePropertyNominalSampleRate,
-            kAudioDevicePropertyBufferFrameSize,
         ]
         let deviceIDs = [inputDevice, outputDevice].compactMap { $0 }
 
@@ -604,6 +617,39 @@ final class AudioRouter {
         clearSavedDevices()
     }
 
+    private func recoverStaleDefaultDevices() {
+        let virtualDeviceIDs = Set(
+            inputDevices
+                .filter { device in
+                    device.name == Self.virtualDeviceName
+                        || device.name == Self.legacyVirtualDeviceName
+                }
+                .map(\.id)
+        )
+        guard !virtualDeviceIDs.isEmpty else {
+            clearSavedDevices()
+            return
+        }
+
+        let fallbackDevice = selectedOutputDevice?.id
+            ?? outputDevices.first { $0.uid == "BuiltInSpeakerDevice" }?.id
+            ?? outputDevices.first { !virtualDeviceIDs.contains($0.id) }?.id
+        let savedOutputDevice = savedOutputDeviceUID.flatMap(Self.device(withUID:))
+        let savedSystemOutputDevice = savedSystemOutputDeviceUID.flatMap(Self.device(withUID:))
+
+        if let currentOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultOutputDevice),
+           virtualDeviceIDs.contains(currentOutput),
+           let replacement = savedOutputDevice ?? fallbackDevice {
+            try? Self.setDefaultDevice(replacement, selector: kAudioHardwarePropertyDefaultOutputDevice)
+        }
+        if let currentSystemOutput = Self.defaultDevice(for: kAudioHardwarePropertyDefaultSystemOutputDevice),
+           virtualDeviceIDs.contains(currentSystemOutput),
+           let replacement = savedSystemOutputDevice ?? savedOutputDevice ?? fallbackDevice {
+            try? Self.setDefaultDevice(replacement, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        }
+        clearSavedDevices()
+    }
+
     private func clearSavedDevices() {
         savedOutputDeviceUID = nil
         savedSystemOutputDeviceUID = nil
@@ -679,22 +725,45 @@ final class AudioRouter {
         defaults.removeObject(forKey: PreferenceKey.volumeSnapshotMute)
     }
 
-    private func optimizeOutputBuffer(for device: AudioDevice) {
+    private func optimizeOutputBuffer(for device: AudioDevice, sampleRate: Float64) -> UInt32? {
         restoreOutputBuffer()
         guard latencyMode == .low,
               let currentFrameSize = Self.bufferFrameSize(of: device.id),
-              currentFrameSize > 256,
               Self.canSetBufferFrameSize(of: device.id),
-              let range = Self.bufferFrameSizeRange(of: device.id) else { return }
+              let range = Self.bufferFrameSizeRange(of: device.id) else { return nil }
 
-        let targetFrameSize = UInt32(min(max(256, range.mMinimum), range.mMaximum))
-        guard targetFrameSize < currentFrameSize else { return }
-        outputBufferSnapshot = OutputBufferSnapshot(deviceUID: device.uid, frameSize: currentFrameSize)
-        do {
-            try Self.setBufferFrameSize(of: device.id, to: targetFrameSize)
-        } catch {
-            outputBufferSnapshot = nil
+        let preferredFrameSize = Self.preferredLowLatencyFrameSize(sampleRate: sampleRate)
+        guard currentFrameSize > preferredFrameSize else { return currentFrameSize }
+        let candidates = [preferredFrameSize, preferredFrameSize * 2, 256, 512]
+            .filter { frameSize in
+                frameSize >= preferredFrameSize
+                    && Double(frameSize) >= range.mMinimum
+                    && Double(frameSize) <= range.mMaximum
+                    && frameSize < currentFrameSize
+            }
+            .reduce(into: [UInt32]()) { result, frameSize in
+                if !result.contains(frameSize) {
+                    result.append(frameSize)
+                }
+            }
+        guard !candidates.isEmpty else { return currentFrameSize }
+
+        for candidate in candidates {
+            do {
+                try Self.setBufferFrameSize(of: device.id, to: candidate)
+                guard let appliedFrameSize = Self.bufferFrameSize(of: device.id),
+                      appliedFrameSize < currentFrameSize else { continue }
+                outputBufferSnapshot = OutputBufferSnapshot(
+                    deviceUID: device.uid,
+                    frameSize: currentFrameSize
+                )
+                return appliedFrameSize
+            } catch {
+                continue
+            }
         }
+        try? Self.setBufferFrameSize(of: device.id, to: currentFrameSize)
+        return currentFrameSize
     }
 
     private func restoreOutputBuffer() {
@@ -940,6 +1009,15 @@ final class AudioRouter {
         var isSettable = DarwinBoolean(false)
         return AudioObjectIsPropertySettable(device, &address, &isSettable) == noErr
             && isSettable.boolValue
+    }
+
+    private static func preferredLowLatencyFrameSize(sampleRate: Float64) -> UInt32 {
+        let targetDuration = 0.0028
+        let idealFrameSize = max(sampleRate * targetDuration, 64)
+        let supportedFrameSizes: [UInt32] = [64, 128, 256, 512, 1_024]
+        return supportedFrameSizes.min { lhs, rhs in
+            abs(Double(lhs) - idealFrameSize) < abs(Double(rhs) - idealFrameSize)
+        } ?? 256
     }
 
     private static func setBufferFrameSize(of device: AudioDeviceID, to frameSize: UInt32) throws {
